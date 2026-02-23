@@ -119,6 +119,6 @@ Evaluation scenarios live in `eval_configs/` organized by type (random, mazes, w
 
 Python: `torch>=2.0`, `pyarrow`, `huggingface_hub`, `pybind11==2.13.1`, `cppimport>=22.8.2`, `wandb`, `loguru`
 
-Note: `pogema-toolbox` is vendored directly in `pogema_toolbox/` (source from v0.1.0) for local modification. It is not installed via pip.
+Note: `pogema-toolbox` is vendored directly in `pogema_toolbox/` and `moving_ai_tiles/` (source from v0.1.0) for local modification. It is not installed via pip.
 
 C++: CMake >= 3.16, Boost, pthreads (required to compile `lacam/` and `tokenizer/cost2go.cpp`)

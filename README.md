@@ -24,6 +24,8 @@ The repository consists of the following crucial parts:
 - `train.py` - a script that launches the training of the MAPF-GPT model.
 - `eval_configs` - a folder that contains configs from the POGEMA benchmark. Required by the `benchmark.py` script.
 - `dataset_configs` - a folder that contains configs to generate training and validation datasets. Required by the `generate_dataset.py` script.
+- `pogema_toolbox/` - vendored source of [pogema-toolbox](https://github.com/Cognitive-AI-Systems/pogema-toolbox) v0.1.0, included directly for local modification.
+- `moving_ai_tiles/` - companion module vendored alongside pogema-toolbox.
 
 ## Local Installation
 
@@ -36,6 +38,8 @@ uv venv --python 3.10
 source .venv/bin/activate
 uv pip install -r docker/requirements.txt
 ```
+
+> **Note:** `pogema-toolbox` is vendored directly in `pogema_toolbox/` and does not need to be installed separately.
 
 ## Docker Installation
 
