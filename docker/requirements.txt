@@ -19,6 +19,6 @@ typing-extensions==4.5.0
 importlib-metadata==4.13.0
 dask[distributed]
 loguru
-pogema-toolbox==0.1.0
+# pogema-toolbox vendored locally in ./pogema_toolbox/
 pyarrow
 huggingface_hub
