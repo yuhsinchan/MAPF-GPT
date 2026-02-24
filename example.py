@@ -8,7 +8,17 @@ from pogema_toolbox.evaluator import run_episode
 from pogema_toolbox.registry import ToolboxRegistry
 
 from create_env import create_eval_env
-from gpt.inference import MAPFGPTInference, MAPFGPTInferenceConfig
+from gpt.inference import (
+    MAPFGPTInference, MAPFGPTInferenceConfig,
+    MAPFGPTWithPIBT, MAPFGPTWithPIBTConfig,
+    PIBTInference, PIBTInferenceConfig,
+)
+
+METHODS = {
+    "mapf-gpt":      (MAPFGPTInference,    MAPFGPTInferenceConfig),
+    "mapf-gpt-pibt": (MAPFGPTWithPIBT,     MAPFGPTWithPIBTConfig),
+    "pibt":          (PIBTInference,        PIBTInferenceConfig),
+}
 
 
 def main():
@@ -24,6 +34,8 @@ def main():
 
     parser.add_argument('--model', type=str, choices=['2M', '6M', '85M'], default='2M',
                         help='Model to use: 2M, 6M, 85M (default: %(default)s)')
+    parser.add_argument('--method', type=str, choices=list(METHODS), default='mapf-gpt',
+                        help='Algorithm to use: mapf-gpt, mapf-gpt-pibt, pibt (default: %(default)s)')
 
     # loading maps from eval folders
     for maps_file in Path("eval_configs").rglob('maps.yaml'):
@@ -59,11 +71,13 @@ def main():
     torch.backends.cudnn.deterministic = True
 
     env = create_eval_env(env_cfg)
-    algo = MAPFGPTInference(MAPFGPTInferenceConfig(path_to_weights=f'weights/model-{args.model}.pt', device=args.device))
+    algo_cls, cfg_cls = METHODS[args.method]
+    cfg_kwargs = {} if args.method == "pibt" else {"path_to_weights": f"weights/model-{args.model}.pt", "device": args.device}
+    algo = algo_cls(cfg_cls(**cfg_kwargs))
     algo.reset_states()
     results = run_episode(env, algo)
 
-    svg_path = f"svg/{args.map_name}-{args.model}-seed-{args.seed}.svg"
+    svg_path = f"svg/{args.map_name}-{args.method}-{args.model}-seed-{args.seed}.svg"
     env.save_animation(svg_path)
     ToolboxRegistry.info(f'Saved animation to: {svg_path}')
 
