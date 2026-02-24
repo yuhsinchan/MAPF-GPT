@@ -234,13 +234,17 @@ class MAPFGPTWithPIBT(MAPFGPTInference):
     MAPF-GPT + PIBT post-processing for collision-free actions.
 
     The GPT model proposes a preferred action per agent.  PIBT then resolves
-    conflicts: agents are processed in descending distance-to-goal order
-    (furthest = highest priority), and each agent tries its GPT-suggested
-    action first before falling back to cost-to-go ordering.
+    conflicts with two CS-PIBT additions:
+      1. Persistent priorities: agents repeatedly overridden accumulate a wait
+         counter that temporarily boosts their priority above distance-only order,
+         preventing starvation.
+      2. Swap detection: after PIBT assigns all actions, any pair of agents
+         swapping positions is resolved by forcing the lower-priority agent to wait.
     """
 
     def __init__(self, cfg: MAPFGPTWithPIBTConfig, net=None):
         super().__init__(cfg, net)
+        self._wait_counters = None  # per-agent int, persists across timesteps
 
     def _dist(self, target_xy, pos):
         return self.cost2go_data[target_xy][pos[0]][pos[1]]
@@ -325,7 +329,14 @@ class MAPFGPTWithPIBT(MAPFGPTInference):
 
         num_agents = len(observations)
 
-        # 2. Assign priorities: furthest from goal = highest priority.
+        # Initialise wait counters on the first call.
+        if self._wait_counters is None:
+            self._wait_counters = [0] * num_agents
+
+        # 2. Assign priorities.
+        #    Primary key: wait_counter (higher = more starved = goes first).
+        #    Secondary key: distance-to-goal (further = higher priority).
+        #    Tertiary key: -agent_idx (deterministic tie-break).
         distances = []
         for obs in observations:
             pos = tuple(obs["global_xy"])
@@ -333,7 +344,10 @@ class MAPFGPTWithPIBT(MAPFGPTInference):
             d = self._dist(target, pos)
             distances.append(d if d >= 0 else 0)
 
-        priority_order = {i: (distances[i], -i) for i in range(num_agents)}
+        priority_order = {
+            i: (self._wait_counters[i], distances[i], -i)
+            for i in range(num_agents)
+        }
         sorted_agents = sorted(range(num_agents), key=lambda i: priority_order[i], reverse=True)
 
         occupied_by = {tuple(obs["global_xy"]): i for i, obs in enumerate(observations)}
@@ -348,15 +362,85 @@ class MAPFGPTWithPIBT(MAPFGPTInference):
 
         final_actions = [a if a is not None else 0 for a in actions]
 
-        # Log any agent whose final action differs from GPT's suggestion.
+        # 3. Swap detection: find pairs (i, j) where i moves to j's cell and
+        #    j moves to i's cell.  Simply forcing the loser to wait would cause
+        #    a vertex collision (winner moves into loser's cell while loser stays
+        #    there).  Instead, re-run _pibt for the loser with its current cell
+        #    added to reserved so it must pick a different cell.  If no other
+        #    cell exists, both agents wait.
+        next_cells = {}
+        for i, a in enumerate(final_actions):
+            dr, dc = ACTIONS[a]
+            pos = tuple(observations[i]["global_xy"])
+            next_cells[i] = (pos[0] + dr, pos[1] + dc)
+
+        resolved = set()  # track already-resolved swaps to avoid double-processing
+        for i in range(num_agents):
+            if i in resolved:
+                continue
+            j = occupied_by.get(next_cells[i])  # agent currently at i's target cell
+            if j is None or j == i:
+                continue
+            if next_cells[j] != tuple(observations[i]["global_xy"]):  # not a swap
+                continue
+
+            # Swap detected between i and j.
+            winner = i if priority_order[i] > priority_order[j] else j
+            loser  = j if winner == i else i
+            resolved.add(i)
+            resolved.add(j)
+
+            loser_pos = tuple(observations[loser]["global_xy"])
+            winner_next = next_cells[winner]
+
+            ToolboxRegistry.info(
+                f"PIBT swap detected: agents {i} and {j}; "
+                f"agent {loser} at {loser_pos} must vacate for agent {winner}"
+            )
+
+            # Re-run PIBT for the loser, blocking its current cell so it is
+            # forced to move elsewhere.  The winner's target cell (loser's
+            # current cell) is also already in reserved from the main PIBT pass.
+            loser_reserved = reserved | {loser_pos}
+            loser_actions = [None] * num_agents
+            loser_actions[loser] = None  # ensure it gets re-assigned
+            success = self._pibt(loser, observations, gpt_probs, priority_order,
+                                 occupied_by, loser_reserved, loser_actions)
+            if success and loser_actions[loser] != 0:
+                final_actions[loser] = loser_actions[loser]
+                next_cells[loser] = (loser_pos[0] + ACTIONS[final_actions[loser]][0],
+                                     loser_pos[1] + ACTIONS[final_actions[loser]][1])
+            else:
+                # Loser truly can't move — winner must also wait to avoid collision.
+                ToolboxRegistry.info(
+                    f"PIBT swap: agent {loser} cannot vacate; "
+                    f"agent {winner} also forced to wait"
+                )
+                final_actions[loser] = 0
+                final_actions[winner] = 0
+                next_cells[loser] = loser_pos
+                next_cells[winner] = winner_next  # will be corrected to stay
+                next_cells[winner] = tuple(observations[winner]["global_xy"])
+
+        # 4. Update persistent wait counters.
+        #    Increment agents whose action was overridden by PIBT or swap resolution;
+        #    reset agents that executed their GPT-preferred action freely.
         for i, (gpt_a, final_a) in enumerate(zip(gpt_actions, final_actions)):
             if gpt_a != final_a:
+                self._wait_counters[i] += 1
                 ToolboxRegistry.info(
                     f"PIBT override: agent {i} at {observations[i]['global_xy']} "
-                    f"redirected from action {gpt_a} to {final_a}"
+                    f"redirected from action {gpt_a} to {final_a} "
+                    f"(wait_counter={self._wait_counters[i]})"
                 )
+            else:
+                self._wait_counters[i] = 0
 
         return final_actions
+
+    def reset_states(self):
+        super().reset_states()
+        self._wait_counters = None
 
 
 class PIBTInferenceConfig(AlgoBase, extra=Extra.forbid):
