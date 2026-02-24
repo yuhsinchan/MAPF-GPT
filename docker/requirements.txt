@@ -22,3 +22,5 @@ loguru
 # pogema-toolbox vendored locally in ./pogema_toolbox/
 pyarrow
 huggingface_hub
+pogema>=1.2.2
+setuptools<=79.0.1
