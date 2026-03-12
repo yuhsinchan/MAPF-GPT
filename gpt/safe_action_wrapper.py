@@ -123,7 +123,6 @@ class DecentralizedWrapper:
         # Per-agent state (initialized on first observation)
         self.num_agents: Optional[int] = None
         self.priorities: Optional[List[int]] = None
-        self.priority_order: Optional[List[int]] = None
         self.cost2go_data = None
         self.action_histories: Optional[List[List[str]]] = None
         self.position_histories: Optional[List[List]] = None
@@ -131,7 +130,6 @@ class DecentralizedWrapper:
     def reset_states(self):
         self.num_agents = None
         self.priorities = None
-        self.priority_order = None
         self.cost2go_data = None
         self.action_histories = None
         self.position_histories = None
@@ -151,9 +149,6 @@ class DecentralizedWrapper:
             random.shuffle(self.priorities)
         else:
             self.priorities = list(range(n))
-
-        # priority_order[0] = agent with highest priority (acts first)
-        self.priority_order = sorted(range(n), key=lambda i: self.priorities[i])
 
         # Cost2go is precomputed from the static obstacle map
         global_obs = observations[0]["global_obstacles"].copy().astype(int).tolist()
@@ -397,18 +392,23 @@ class DecentralizedWrapper:
         do_sample: bool = True,
     ) -> List[int]:
         """
-        Decentralized safe action selection with fixed priorities.
+        Simultaneous decentralized safe action selection.
 
-        For each agent (processed in priority order):
-        1. Get ego action probabilities (full context window).
-        2. Simulate higher-priority visible neighbors using the shared
-           policy with reduced context window.
-        3. Treat higher-priority agents' predicted actions as committed.
-        4. Mask/penalize ego actions that conflict, sample from remainder.
+        All agents commit at the same time. Priority is only used as a
+        tie-breaking rule: when a potential collision is detected, the
+        lower-priority agent yields (avoids the cell) while the
+        higher-priority agent is free to go there.
 
-        Since all agents use the same deterministic policy and priorities,
-        they independently arrive at consistent predictions without
-        any communication.
+        Each agent independently:
+        1. Gets its own action distribution (full context window).
+        2. Simulates higher-priority visible neighbors to predict where
+           they will go (using shared policy + reduced context window).
+        3. Avoids cells that higher-priority neighbors are predicted to
+           occupy (vertex conflict) or would cause a swap (edge conflict).
+        4. Samples from the adjusted distribution.
+
+        Since everyone runs the same policy with the same priorities,
+        predictions are consistent without communication.
 
         Args:
             observations: Per-agent observations from the environment.
@@ -424,48 +424,64 @@ class DecentralizedWrapper:
         # 1. Get all agents' action probs in one batch (full context)
         all_probs = self.get_action_probs(observations)
 
-        # 2. Committed actions: processed in priority order
-        #    committed_next[agent_idx] = predicted next position
-        committed_next: Dict[int, tuple] = {}
+        # 2. For each agent, predict higher-priority neighbors' most
+        #    likely next position via simulation with reduced window.
+        #    Batch all neighbor simulations across all agents.
+        sim_requests = []  # (ego_idx, neighbor_idx)
+        sim_inputs = []
+
+        for ego_idx in range(num_agents):
+            visible = self._get_visible_neighbors(ego_idx, observations)
+            higher = [
+                n for n in visible
+                if self.priorities[n] < self.priorities[ego_idx]
+            ]
+            if not higher:
+                continue
+
+            ego_visible_set = set(visible) | {ego_idx}
+            for n in higher:
+                pool = list(ego_visible_set | {n})
+                context = self._get_sorted_context_agents(
+                    n, observations, pool
+                )
+                sim_inputs.append(
+                    self._build_input(
+                        n, observations, self.sim_num_agents, context
+                    )
+                )
+                sim_requests.append((ego_idx, n))
+
+        # Run all neighbor simulations in one batch
+        sim_probs = self._forward_batch(sim_inputs, self.sim_encoder)
+
+        # Build lookup: for each ego, what are the predicted next
+        # positions of its higher-priority neighbors?
+        hp_predicted_next: Dict[int, Dict[int, tuple]] = {}
+        for i, (ego_idx, n) in enumerate(sim_requests):
+            predicted_action = torch.argmax(sim_probs[i]).item()
+            dx, dy = ACTION_TO_DELTA[predicted_action]
+            n_next = (positions[n][0] + dx, positions[n][1] + dy)
+            if ego_idx not in hp_predicted_next:
+                hp_predicted_next[ego_idx] = {}
+            hp_predicted_next[ego_idx][n] = n_next
+
+        # 3. All agents commit simultaneously
         final_actions = [0] * num_agents
 
-        for agent_idx in self.priority_order:
-            ego_pos = positions[agent_idx]
-            ego_probs = all_probs[agent_idx].clone()
+        for ego_idx in range(num_agents):
+            ego_pos = positions[ego_idx]
+            ego_probs = all_probs[ego_idx].clone()
+            neighbors_next = hp_predicted_next.get(ego_idx, {})
 
-            # 3. Simulate higher-priority visible neighbors
-            visible = self._get_visible_neighbors(agent_idx, observations)
-            higher_priority_visible = [
-                n for n in visible
-                if self.priorities[n] < self.priorities[agent_idx]
-            ]
-
-            # For higher-priority agents, use their committed actions
-            # (they've already been processed)
-            hp_next_positions = {}
-            for n in higher_priority_visible:
-                if n in committed_next:
-                    hp_next_positions[n] = committed_next[n]
-                else:
-                    # Shouldn't happen if processed in priority order,
-                    # but fall back to simulated argmax
-                    sim_probs = self.simulate_neighbor(n, agent_idx, observations)
-                    predicted_action = torch.argmax(sim_probs).item()
-                    dx, dy = ACTION_TO_DELTA[predicted_action]
-                    hp_next_positions[n] = (
-                        positions[n][0] + dx, positions[n][1] + dy
-                    )
-
-            # 4. Check each candidate action for conflicts with
-            #    higher-priority committed moves
             for action_idx in range(5):
                 dx, dy = ACTION_TO_DELTA[action_idx]
                 ego_next = (ego_pos[0] + dx, ego_pos[1] + dy)
 
-                for other_idx, other_next in hp_next_positions.items():
+                for other_idx, other_next in neighbors_next.items():
                     other_pos = positions[other_idx]
 
-                    # Vertex conflict
+                    # Vertex conflict: both would occupy the same cell
                     if ego_next == other_next:
                         if conflict_penalty == 0.0:
                             ego_probs[action_idx] = 0.0
@@ -473,7 +489,7 @@ class DecentralizedWrapper:
                             ego_probs[action_idx] *= conflict_penalty
                         break
 
-                    # Edge conflict (swap)
+                    # Edge conflict: agents would swap cells
                     if ego_next == other_pos and other_next == ego_pos:
                         if conflict_penalty == 0.0:
                             ego_probs[action_idx] = 0.0
@@ -481,7 +497,7 @@ class DecentralizedWrapper:
                             ego_probs[action_idx] *= conflict_penalty
                         break
 
-            # 5. Select action from adjusted distribution
+            # 4. Select action from adjusted distribution
             total = ego_probs.sum()
             if total == 0:
                 action = 0  # wait as safe fallback
@@ -491,11 +507,7 @@ class DecentralizedWrapper:
             else:
                 action = torch.argmax(ego_probs).item()
 
-            final_actions[agent_idx] = action
-
-            # Commit this agent's action
-            dx, dy = ACTION_TO_DELTA[action]
-            committed_next[agent_idx] = (ego_pos[0] + dx, ego_pos[1] + dy)
+            final_actions[ego_idx] = action
 
         return final_actions
 
@@ -515,11 +527,10 @@ class DecentralizedWrapper:
         Like act(), but also returns diagnostics.
 
         Returns dict with:
-            actions: List[int]
+            actions: List[int] — chosen safe actions (all simultaneous)
             probs: Tensor (N, 5) — raw policy probabilities
             priorities: List[int] — priority assignments
-            committed_positions: Dict[int, tuple] — each agent's committed
-                next position in priority order
+            next_positions: Dict[int, tuple] — each agent's next position
         """
         if self.num_agents is None:
             self._initialize(observations)
@@ -529,15 +540,15 @@ class DecentralizedWrapper:
         all_probs = self.get_action_probs(observations)
         actions = self.get_safe_action(observations)
 
-        committed = {}
         positions = [tuple(obs["global_xy"]) for obs in observations]
+        next_positions = {}
         for i, a in enumerate(actions):
             dx, dy = ACTION_TO_DELTA[a]
-            committed[i] = (positions[i][0] + dx, positions[i][1] + dy)
+            next_positions[i] = (positions[i][0] + dx, positions[i][1] + dy)
 
         return {
             "actions": actions,
             "probs": all_probs,
             "priorities": self.priorities,
-            "committed_positions": committed,
+            "next_positions": next_positions,
         }
