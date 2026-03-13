@@ -35,17 +35,21 @@ ACTION_TO_DELTA = {
     4: (0, 1),   # right
 }
 
+MOVES_STR = {0: "w", 1: "u", 2: "d", 3: "l", 4: "r"}
+
 
 class DecentralizedWrapper:
     """
-    Fully decentralized safety wrapper with fixed priorities.
+    Fully decentralized safety wrapper with fixed priorities and
+    multi-step occupancy-based safety cost field.
 
     Each agent independently:
     1. Runs the shared policy to get its own action distribution.
-    2. Simulates higher-priority visible neighbors' actions using the
-       same policy with a reduced context window.
-    3. Selects a safe action that avoids vertex/edge conflicts with
-       predicted higher-priority moves.
+    2. Simulates higher-priority visible neighbors' trajectories for
+       multiple steps, building a probabilistic occupancy field.
+    3. Simulates its own future trajectory for each candidate action.
+    4. Penalizes actions whose trajectories overlap with the occupancy
+       field, then samples from the adjusted distribution.
 
     Usage (drop-in replacement for MAPFGPTInference):
         wrapper = DecentralizedWrapper(cfg)
@@ -58,6 +62,9 @@ class DecentralizedWrapper:
         cfg: MAPFGPTInferenceConfig,
         priority_scheme: Literal["index", "random"] = "index",
         sim_num_agents: int = 1,
+        horizon: int = 1,
+        gamma: float = 0.9,
+        safety_lambda: float = 5.0,
     ):
         """
         Args:
@@ -65,13 +72,20 @@ class DecentralizedWrapper:
             priority_scheme: How to assign priorities.
                 "index" = agent 0 has highest priority.
                 "random" = random shuffle at episode start.
-            sim_num_agents: Number of agent slots to use when simulating
-                a neighbor's observation. Lower = faster but less context.
-                Set to 1 to only include the simulated agent itself.
+            sim_num_agents: Number of agent slots in reduced context window
+                for neighbor/ego forward simulation.
+            horizon: Number of steps to simulate forward. 1 = single-step
+                hard-mask (original behavior). >1 = multi-step cost field.
+            gamma: Discount factor for future occupancy danger (0 < gamma <= 1).
+            safety_lambda: Penalty strength. Higher = more conservative.
+                P_adjusted(a) ∝ P_policy(a) * exp(-lambda * danger(a))
         """
         self.cfg = cfg
         self.priority_scheme = priority_scheme
         self.sim_num_agents = sim_num_agents
+        self.horizon = horizon
+        self.gamma = gamma
+        self.safety_lambda = safety_lambda
 
         # Load model
         path_to_weights = Path(cfg.path_to_weights)
@@ -92,7 +106,7 @@ class DecentralizedWrapper:
         self.net.to(cfg.device)
         self.net.eval()
 
-        # Encoder for full observations (ego agent)
+        # Encoder for full observations (ego agent's own action)
         self.encoder = Encoder(InputParameters(
             num_agents=cfg.num_agents,
             num_previous_actions=cfg.num_previous_actions,
@@ -106,7 +120,7 @@ class DecentralizedWrapper:
             mask_greed_action=cfg.mask_greed_action,
         ))
 
-        # Encoder for reduced-window neighbor simulation
+        # Encoder for reduced-window simulation (neighbors + ego rollout)
         self.sim_encoder = Encoder(InputParameters(
             num_agents=sim_num_agents,
             num_previous_actions=cfg.num_previous_actions,
@@ -142,7 +156,6 @@ class DecentralizedWrapper:
         n = len(observations)
         self.num_agents = n
 
-        # Assign priorities (lower value = higher priority)
         if self.priority_scheme == "random":
             import random
             self.priorities = list(range(n))
@@ -150,7 +163,6 @@ class DecentralizedWrapper:
         else:
             self.priorities = list(range(n))
 
-        # Cost2go is precomputed from the static obstacle map
         global_obs = observations[0]["global_obstacles"].copy().astype(int).tolist()
         self.cost2go_data = cost2go.precompute_cost2go(
             global_obs, self.cfg.cost2go_radius
@@ -210,13 +222,7 @@ class DecentralizedWrapper:
     def _get_sorted_context_agents(
         self, ego_idx: int, observations, candidate_pool: Optional[List[int]] = None
     ) -> List[int]:
-        """
-        Get agents sorted by cost2go distance from ego, as generate_input does.
-
-        Args:
-            candidate_pool: If given, only consider these agent indices.
-                Otherwise consider all agents.
-        """
+        """Get agents sorted by cost2go distance from ego."""
         ego_pos = tuple(observations[ego_idx]["global_xy"])
         pool = candidate_pool if candidate_pool is not None else list(range(self.num_agents))
         distances = []
@@ -231,15 +237,7 @@ class DecentralizedWrapper:
     def _build_input(
         self, ego_idx: int, observations, max_agents: int, context_agents: List[int]
     ) -> dict:
-        """
-        Build tokenizer input dict for a single agent.
-
-        Args:
-            ego_idx: The agent to build the observation for.
-            max_agents: How many agent slots to fill (self.cfg.num_agents
-                for ego, self.sim_num_agents for simulation).
-            context_agents: Sorted list of agent indices to include.
-        """
+        """Build tokenizer input dict for a single agent from observations."""
         ego_pos = observations[ego_idx]["global_xy"]
         ego_target = tuple(observations[ego_idx]["global_target_xy"])
 
@@ -274,8 +272,33 @@ class DecentralizedWrapper:
             ),
         }
 
+    def _build_sim_input(self, pos: tuple, target: tuple, action_history: list) -> dict:
+        """
+        Build tokenizer input for a single agent at a simulated position.
+
+        Used for multi-step forward simulation where the agent's position
+        has been hypothetically advanced. Uses sim_num_agents=1 context
+        (only the agent itself).
+        """
+        agents_info = [{
+            "relative_pos": (0, 0),
+            "relative_goal": (target[0] - pos[0], target[1] - pos[1]),
+            "previous_actions": action_history,
+            "next_action": self._compute_greedy_action(pos, target),
+        }]
+        return {
+            "agents": agents_info,
+            "cost2go": cost2go.generate_cost2go_obs(
+                self.cost2go_data[target],
+                [pos[0], pos[1]],
+                self.cfg.cost2go_radius,
+                self.cfg.cost2go_value_limit,
+                self.cfg.mask_cost2go,
+            ),
+        }
+
     # ------------------------------------------------------------------
-    # Forward pass helpers
+    # Forward pass
     # ------------------------------------------------------------------
 
     def _forward_batch(self, inputs: list, encoder: Encoder) -> torch.Tensor:
@@ -302,6 +325,123 @@ class DecentralizedWrapper:
         return probs
 
     # ------------------------------------------------------------------
+    # Multi-step simulation
+    # ------------------------------------------------------------------
+
+    def _simulate_hp_trajectories(
+        self, observations, horizon: int
+    ) -> Dict[int, List[Dict[tuple, float]]]:
+        """
+        Simulate all unique higher-priority neighbors' trajectories.
+
+        At each step:
+        - Run the shared policy to get the FULL probability distribution
+          over 5 actions.
+        - Record the distribution as occupancy: each reachable cell gets
+          the probability mass of the action leading there.
+        - Advance the position by argmax for the next step's simulation.
+
+        This gives a soft occupancy field — cells along the most likely
+        path get high probability, but adjacent cells also get nonzero
+        mass from alternative actions.
+
+        Returns:
+            Dict[neighbor_idx -> list of h occupancy dicts].
+            Each occupancy dict maps (x, y) -> probability.
+        """
+        # Collect all unique neighbors that any ego needs simulated
+        all_hp_neighbors = set()
+        for ego_idx in range(self.num_agents):
+            visible = self._get_visible_neighbors(ego_idx, observations)
+            for n in visible:
+                if self.priorities[n] < self.priorities[ego_idx]:
+                    all_hp_neighbors.add(n)
+
+        if not all_hp_neighbors:
+            return {}
+
+        hp_list = sorted(all_hp_neighbors)
+
+        # Initialize simulated state for each neighbor
+        sim_states = {}
+        for n in hp_list:
+            sim_states[n] = {
+                "pos": tuple(observations[n]["global_xy"]),
+                "target": tuple(observations[n]["global_target_xy"]),
+                "history": list(self.action_histories[n]),
+            }
+
+        trajectories: Dict[int, List[Dict[tuple, float]]] = {n: [] for n in hp_list}
+
+        for t in range(horizon):
+            # Build inputs for all neighbors at current simulated positions
+            inputs = []
+            for n in hp_list:
+                s = sim_states[n]
+                inputs.append(
+                    self._build_sim_input(s["pos"], s["target"], s["history"])
+                )
+
+            # One batched forward pass for all neighbors at this step
+            all_probs = self._forward_batch(inputs, self.sim_encoder)
+
+            for i, n in enumerate(hp_list):
+                probs = all_probs[i]
+                s = sim_states[n]
+
+                # Record full probability distribution as occupancy
+                step_occ: Dict[tuple, float] = {}
+                for a in range(5):
+                    dx, dy = ACTION_TO_DELTA[a]
+                    next_pos = (s["pos"][0] + dx, s["pos"][1] + dy)
+                    p = probs[a].item()
+                    if p > 1e-6:
+                        step_occ[next_pos] = step_occ.get(next_pos, 0.0) + p
+                trajectories[n].append(step_occ)
+
+                # Advance by argmax for next step
+                best = torch.argmax(probs).item()
+                dx, dy = ACTION_TO_DELTA[best]
+                s["pos"] = (s["pos"][0] + dx, s["pos"][1] + dy)
+                s["history"] = list(s["history"]) + [MOVES_STR[best]]
+                s["history"] = s["history"][-self.cfg.num_previous_actions:]
+
+        return trajectories
+
+    def _build_ego_occupancy(
+        self, ego_idx: int, observations, trajectories: dict
+    ) -> List[Dict[tuple, float]]:
+        """
+        Build per-ego occupancy field from higher-priority neighbors.
+
+        Only includes neighbors that are visible to the ego agent.
+        Sums occupancy probabilities from all relevant neighbors at
+        each cell and step.
+
+        Returns:
+            List of h occupancy dicts. occupancy[t][(x,y)] = total
+            probability of any higher-priority neighbor being there.
+        """
+        visible = self._get_visible_neighbors(ego_idx, observations)
+        hp_neighbors = [
+            n for n in visible
+            if self.priorities[n] < self.priorities[ego_idx] and n in trajectories
+        ]
+
+        if not hp_neighbors:
+            return [{} for _ in range(len(next(iter(trajectories.values())))) ] if trajectories else []
+
+        horizon = len(trajectories[hp_neighbors[0]])
+        occupancy = []
+        for t in range(horizon):
+            step_occ: Dict[tuple, float] = {}
+            for n in hp_neighbors:
+                for pos, prob in trajectories[n][t].items():
+                    step_occ[pos] = step_occ.get(pos, 0.0) + prob
+            occupancy.append(step_occ)
+        return occupancy
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -326,20 +466,16 @@ class DecentralizedWrapper:
         observations,
     ) -> torch.Tensor:
         """
-        Simulate a single neighbor's action from the ego agent's perspective.
-
-        Constructs the neighbor's observation using only agents visible to
-        the ego agent (intersection of views), with a reduced context window.
+        Simulate a single neighbor's action from the ego's perspective.
+        Uses reduced context window (single step).
 
         Returns:
-            Tensor of shape (5,) — action probabilities for the neighbor.
+            Tensor of shape (5,) — action probabilities.
         """
-        # Only include agents that ego can see (decentralized constraint)
         ego_visible = set(self._get_visible_neighbors(ego_idx, observations))
-        ego_visible.add(ego_idx)  # ego is visible to the neighbor
-        ego_visible.add(neighbor_idx)  # neighbor sees itself
+        ego_visible.add(ego_idx)
+        ego_visible.add(neighbor_idx)
 
-        # Sort by distance from the neighbor's perspective
         pool = list(ego_visible)
         context = self._get_sorted_context_agents(neighbor_idx, observations, pool)
         inp = self._build_input(
@@ -355,10 +491,10 @@ class DecentralizedWrapper:
         only_higher_priority: bool = True,
     ) -> Dict[int, torch.Tensor]:
         """
-        Simulate all visible neighbors of ego (optionally only higher priority).
+        Simulate all visible neighbors of ego (single step, batched).
 
         Returns:
-            Dict[neighbor_idx -> Tensor of shape (5,)] with action probs.
+            Dict[neighbor_idx -> Tensor of shape (5,)].
         """
         visible = self._get_visible_neighbors(ego_idx, observations)
         if only_higher_priority:
@@ -370,11 +506,9 @@ class DecentralizedWrapper:
         if not visible:
             return {}
 
-        # Ego's visible set (used to restrict neighbor context)
         ego_visible_set = set(self._get_visible_neighbors(ego_idx, observations))
         ego_visible_set.add(ego_idx)
 
-        # Batch all neighbor simulations
         inputs = []
         for n in visible:
             pool = list(ego_visible_set | {n})
@@ -388,48 +522,49 @@ class DecentralizedWrapper:
     def get_safe_action(
         self,
         observations,
-        conflict_penalty: float = 0.0,
         do_sample: bool = True,
     ) -> List[int]:
         """
-        Simultaneous decentralized safe action selection.
+        Select safe actions for all agents simultaneously.
 
-        All agents commit at the same time. Priority is only used as a
-        tie-breaking rule: when a potential collision is detected, the
-        lower-priority agent yields (avoids the cell) while the
-        higher-priority agent is free to go there.
+        When horizon=1: single-step hard-mask approach. Each agent
+        masks actions that conflict with higher-priority neighbors'
+        predicted argmax moves.
 
-        Each agent independently:
-        1. Gets its own action distribution (full context window).
-        2. Simulates higher-priority visible neighbors to predict where
-           they will go (using shared policy + reduced context window).
-        3. Avoids cells that higher-priority neighbors are predicted to
-           occupy (vertex conflict) or would cause a swap (edge conflict).
-        4. Samples from the adjusted distribution.
-
-        Since everyone runs the same policy with the same priorities,
-        predictions are consistent without communication.
+        When horizon>1: multi-step cost field approach.
+        1. Simulate higher-priority neighbors for `horizon` steps,
+           recording the full probability distribution at each step
+           as a soft occupancy field.
+        2. For each ego candidate action, simulate ego forward for
+           `horizon` steps and accumulate danger from the occupancy
+           field with gamma discount.
+        3. Adjust action probabilities:
+           P_adjusted(a) ∝ P_policy(a) * exp(-lambda * danger(a))
 
         Args:
             observations: Per-agent observations from the environment.
-            conflict_penalty: 0.0 = hard mask, >0 = soft penalty.
             do_sample: True = sample, False = argmax.
 
         Returns:
             List of action indices, one per agent.
         """
+        if self.horizon <= 1:
+            return self._get_safe_action_single_step(observations, do_sample)
+        else:
+            return self._get_safe_action_multistep(observations, do_sample)
+
+    def _get_safe_action_single_step(
+        self, observations, do_sample: bool
+    ) -> List[int]:
+        """Original single-step hard-mask approach."""
         num_agents = self.num_agents
         positions = [tuple(obs["global_xy"]) for obs in observations]
 
-        # 1. Get all agents' action probs in one batch (full context)
         all_probs = self.get_action_probs(observations)
 
-        # 2. For each agent, predict higher-priority neighbors' most
-        #    likely next position via simulation with reduced window.
-        #    Batch all neighbor simulations across all agents.
-        sim_requests = []  # (ego_idx, neighbor_idx)
+        # Batch all neighbor simulations
+        sim_requests = []
         sim_inputs = []
-
         for ego_idx in range(num_agents):
             visible = self._get_visible_neighbors(ego_idx, observations)
             higher = [
@@ -438,25 +573,17 @@ class DecentralizedWrapper:
             ]
             if not higher:
                 continue
-
             ego_visible_set = set(visible) | {ego_idx}
             for n in higher:
                 pool = list(ego_visible_set | {n})
-                context = self._get_sorted_context_agents(
-                    n, observations, pool
-                )
+                context = self._get_sorted_context_agents(n, observations, pool)
                 sim_inputs.append(
-                    self._build_input(
-                        n, observations, self.sim_num_agents, context
-                    )
+                    self._build_input(n, observations, self.sim_num_agents, context)
                 )
                 sim_requests.append((ego_idx, n))
 
-        # Run all neighbor simulations in one batch
         sim_probs = self._forward_batch(sim_inputs, self.sim_encoder)
 
-        # Build lookup: for each ego, what are the predicted next
-        # positions of its higher-priority neighbors?
         hp_predicted_next: Dict[int, Dict[int, tuple]] = {}
         for i, (ego_idx, n) in enumerate(sim_requests):
             predicted_action = torch.argmax(sim_probs[i]).item()
@@ -466,9 +593,7 @@ class DecentralizedWrapper:
                 hp_predicted_next[ego_idx] = {}
             hp_predicted_next[ego_idx][n] = n_next
 
-        # 3. All agents commit simultaneously
         final_actions = [0] * num_agents
-
         for ego_idx in range(num_agents):
             ego_pos = positions[ego_idx]
             ego_probs = all_probs[ego_idx].clone()
@@ -477,37 +602,151 @@ class DecentralizedWrapper:
             for action_idx in range(5):
                 dx, dy = ACTION_TO_DELTA[action_idx]
                 ego_next = (ego_pos[0] + dx, ego_pos[1] + dy)
-
                 for other_idx, other_next in neighbors_next.items():
                     other_pos = positions[other_idx]
-
-                    # Vertex conflict: both would occupy the same cell
                     if ego_next == other_next:
-                        if conflict_penalty == 0.0:
-                            ego_probs[action_idx] = 0.0
-                        else:
-                            ego_probs[action_idx] *= conflict_penalty
+                        ego_probs[action_idx] = 0.0
                         break
-
-                    # Edge conflict: agents would swap cells
                     if ego_next == other_pos and other_next == ego_pos:
-                        if conflict_penalty == 0.0:
-                            ego_probs[action_idx] = 0.0
-                        else:
-                            ego_probs[action_idx] *= conflict_penalty
+                        ego_probs[action_idx] = 0.0
                         break
 
-            # 4. Select action from adjusted distribution
             total = ego_probs.sum()
             if total == 0:
-                action = 0  # wait as safe fallback
+                action = 0
             elif do_sample:
                 ego_probs = ego_probs / total
                 action = torch.multinomial(ego_probs, num_samples=1).item()
             else:
                 action = torch.argmax(ego_probs).item()
-
             final_actions[ego_idx] = action
+
+        return final_actions
+
+    def _get_safe_action_multistep(
+        self, observations, do_sample: bool
+    ) -> List[int]:
+        """
+        Multi-step cost field approach.
+
+        Forward passes (all batched):
+        - 1 pass: ego action probs (N agents, full context)
+        - h passes: neighbor trajectory simulation (unique hp neighbors)
+        - h-1 passes: ego trajectory rollout (N*5 candidates)
+        Total: 2h forward passes.
+        """
+        num_agents = self.num_agents
+        h = self.horizon
+        positions = [tuple(obs["global_xy"]) for obs in observations]
+        targets = [tuple(obs["global_target_xy"]) for obs in observations]
+
+        # --- 1. Ego action probs (full context) ---
+        all_probs = self.get_action_probs(observations)
+
+        # --- 2. Simulate higher-priority neighbors' trajectories ---
+        trajectories = self._simulate_hp_trajectories(observations, h)
+
+        # --- 3. Build per-ego occupancy fields ---
+        ego_occupancies = []
+        for ego_idx in range(num_agents):
+            if trajectories:
+                occ = self._build_ego_occupancy(ego_idx, observations, trajectories)
+            else:
+                occ = [{} for _ in range(h)]
+            ego_occupancies.append(occ)
+
+        # --- 4. Simulate ego trajectory for each candidate action ---
+        # Initialize: for each ego × each candidate action, compute
+        # position after taking that action and updated history.
+        # sim_entries[ego_idx * 5 + action] = state
+        sim_entries = []
+        danger = torch.zeros(num_agents, 5, device=self.cfg.device)
+
+        for ego_idx in range(num_agents):
+            ego_pos = positions[ego_idx]
+            ego_history = self.action_histories[ego_idx]
+
+            for a in range(5):
+                dx, dy = ACTION_TO_DELTA[a]
+                next_pos = (ego_pos[0] + dx, ego_pos[1] + dy)
+                new_history = list(ego_history) + [MOVES_STR[a]]
+                new_history = new_history[-self.cfg.num_previous_actions:]
+
+                sim_entries.append({
+                    "pos": next_pos,
+                    "target": targets[ego_idx],
+                    "history": new_history,
+                })
+
+                # Danger at t=0: occupancy at the position ego moves to
+                occ = ego_occupancies[ego_idx]
+                if occ:
+                    danger[ego_idx, a] += occ[0].get(next_pos, 0.0)
+
+                    # Also check edge conflict at t=0: ego goes to
+                    # neighbor's current pos while neighbor goes to
+                    # ego's current pos
+                    visible = self._get_visible_neighbors(ego_idx, observations)
+                    for n in visible:
+                        if self.priorities[n] >= self.priorities[ego_idx]:
+                            continue
+                        if n not in trajectories:
+                            continue
+                        n_pos = positions[n]
+                        if next_pos == n_pos:
+                            # Check if neighbor is moving to ego's pos
+                            n_to_ego_prob = trajectories[n][0].get(ego_pos, 0.0)
+                            danger[ego_idx, a] += n_to_ego_prob
+
+        # Steps t=1..h-1: roll out ego trajectories in batches
+        for t in range(1, h):
+            # Build sim inputs for all N*5 entries
+            inputs = []
+            for entry in sim_entries:
+                inputs.append(
+                    self._build_sim_input(
+                        entry["pos"], entry["target"], entry["history"]
+                    )
+                )
+
+            # One batched forward pass for all ego candidates
+            step_probs = self._forward_batch(inputs, self.sim_encoder)
+
+            # Advance each entry by argmax, accumulate danger
+            for idx, entry in enumerate(sim_entries):
+                ego_idx = idx // 5
+                a = idx % 5
+
+                best = torch.argmax(step_probs[idx]).item()
+                dx, dy = ACTION_TO_DELTA[best]
+                entry["pos"] = (entry["pos"][0] + dx, entry["pos"][1] + dy)
+                entry["history"] = (
+                    list(entry["history"]) + [MOVES_STR[best]]
+                )[-self.cfg.num_previous_actions:]
+
+                # Accumulate discounted danger
+                occ = ego_occupancies[ego_idx]
+                if t < len(occ):
+                    danger[ego_idx, a] += (
+                        (self.gamma ** t) * occ[t].get(entry["pos"], 0.0)
+                    )
+
+        # --- 5. Adjust probabilities and select actions ---
+        final_actions = [0] * num_agents
+        adjusted = all_probs * torch.exp(-self.safety_lambda * danger)
+
+        for ego_idx in range(num_agents):
+            ego_adjusted = adjusted[ego_idx]
+            total = ego_adjusted.sum()
+            if total == 0:
+                final_actions[ego_idx] = 0  # wait as fallback
+            elif do_sample:
+                ego_adjusted = ego_adjusted / total
+                final_actions[ego_idx] = torch.multinomial(
+                    ego_adjusted, num_samples=1
+                ).item()
+            else:
+                final_actions[ego_idx] = torch.argmax(ego_adjusted).item()
 
         return final_actions
 

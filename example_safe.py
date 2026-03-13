@@ -28,6 +28,12 @@ def main():
                         help='Priority assignment: index or random (default: %(default)s)')
     parser.add_argument('--sim_num_agents', type=int, default=1,
                         help='Agent slots in reduced window for neighbor simulation (default: %(default)d)')
+    parser.add_argument('--horizon', type=int, default=3,
+                        help='Steps to simulate forward. 1=single-step hard mask, >1=multi-step cost field (default: %(default)d)')
+    parser.add_argument('--gamma', type=float, default=0.9,
+                        help='Discount factor for future occupancy danger (default: %(default)s)')
+    parser.add_argument('--safety_lambda', type=float, default=5.0,
+                        help='Penalty strength. Higher=more conservative (default: %(default)s)')
 
     # loading maps from eval folders
     for maps_file in Path("eval_configs").rglob('maps.yaml'):
@@ -71,6 +77,9 @@ def main():
         cfg,
         priority_scheme=args.priority_scheme,
         sim_num_agents=args.sim_num_agents,
+        horizon=args.horizon,
+        gamma=args.gamma,
+        safety_lambda=args.safety_lambda,
     )
     algo.reset_states()
     results = run_episode(env, algo)
