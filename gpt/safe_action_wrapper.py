@@ -38,6 +38,58 @@ ACTION_TO_DELTA = {
 MOVES_STR = {0: "w", 1: "u", 2: "d", 3: "l", 4: "r"}
 
 
+def count_collisions(positions: list, actions: list) -> dict:
+    """
+    Count vertex and edge collisions from positions and actions.
+
+    Args:
+        positions: List of (x, y) tuples, one per agent.
+        actions: List of action indices (0-4), one per agent.
+
+    Returns:
+        Dict with:
+            vertex: number of vertex collisions (2+ agents at same cell)
+            edge: number of edge collisions (two agents swapping cells)
+            total: vertex + edge
+            agents_in_vertex: set of agent indices involved in vertex collisions
+            agents_in_edge: set of agent indices involved in edge collisions
+    """
+    n = len(positions)
+    next_positions = []
+    for i in range(n):
+        dx, dy = ACTION_TO_DELTA[actions[i]]
+        next_positions.append((positions[i][0] + dx, positions[i][1] + dy))
+
+    vertex_collisions = 0
+    edge_collisions = 0
+    agents_in_vertex = set()
+    agents_in_edge = set()
+
+    # Vertex: multiple agents at the same next position
+    cell_to_agents: Dict[tuple, List[int]] = {}
+    for i, pos in enumerate(next_positions):
+        cell_to_agents.setdefault(pos, []).append(i)
+    for cell, agents_at_cell in cell_to_agents.items():
+        if len(agents_at_cell) > 1:
+            vertex_collisions += len(agents_at_cell) - 1
+            agents_in_vertex.update(agents_at_cell)
+
+    # Edge: agents swap positions
+    for i in range(n):
+        for j in range(i + 1, n):
+            if next_positions[i] == positions[j] and next_positions[j] == positions[i]:
+                edge_collisions += 1
+                agents_in_edge.update([i, j])
+
+    return {
+        "vertex": vertex_collisions,
+        "edge": edge_collisions,
+        "total": vertex_collisions + edge_collisions,
+        "agents_in_vertex": agents_in_vertex,
+        "agents_in_edge": agents_in_edge,
+    }
+
+
 def _load_model(cfg: MAPFGPTInferenceConfig) -> GPT:
     """Download weights if needed, load model onto device."""
     path_to_weights = Path(cfg.path_to_weights)
