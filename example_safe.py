@@ -30,10 +30,16 @@ def main():
                         help='Agent slots in reduced window for neighbor simulation (default: %(default)d)')
     parser.add_argument('--horizon', type=int, default=3,
                         help='Steps to simulate forward. 1=single-step hard mask, >1=multi-step cost field (default: %(default)d)')
-    parser.add_argument('--gamma', type=float, default=0.9,
-                        help='Discount factor for future occupancy danger (default: %(default)s)')
-    parser.add_argument('--safety_lambda', type=float, default=5.0,
-                        help='Penalty strength. Higher=more conservative (default: %(default)s)')
+    parser.add_argument('--epsilon', type=float, default=0.1,
+                        help='Pruning threshold for trajectory tree branching (default: %(default)s)')
+    parser.add_argument('--alpha', type=float, default=0.5,
+                        help='Decay factor for implicit risk propagation (default: %(default)s)')
+    parser.add_argument('--lambda_1', type=float, default=1.0,
+                        help='Weight for policy log-prob in cost function (default: %(default)s)')
+    parser.add_argument('--lambda_2', type=float, default=1.0,
+                        help='Weight for risk map in cost function (default: %(default)s)')
+    parser.add_argument('--sequential', action='store_true',
+                        help='Simulate hp neighbors in priority order (default: independent)')
 
     # loading maps from eval folders
     for maps_file in Path("eval_configs").rglob('maps.yaml'):
@@ -78,8 +84,11 @@ def main():
         priority_scheme=args.priority_scheme,
         sim_num_agents=args.sim_num_agents,
         horizon=args.horizon,
-        gamma=args.gamma,
-        safety_lambda=args.safety_lambda,
+        epsilon=args.epsilon,
+        alpha=args.alpha,
+        lambda_1=args.lambda_1,
+        lambda_2=args.lambda_2,
+        sequential_simulation=args.sequential,
     )
     algo.reset_states()
     results = run_episode(env, algo)

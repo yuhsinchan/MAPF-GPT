@@ -28,7 +28,7 @@ Drop-in replacement for `MAPFGPTInference`. Same `act(observations)` /
 
 ```
 DecentralizedWrapper
-├── __init__(cfg, priority_scheme, sim_num_agents, horizon, gamma, safety_lambda)
+├── __init__(cfg, priority_scheme, sim_num_agents, horizon, epsilon, alpha, lambda_1, lambda_2, sequential_simulation)
 ├── act(observations) → List[int]              # main entry point
 ├── act_with_info(observations) → dict         # with diagnostics
 ├── get_action_probs(observations) → (N,5)     # raw policy probs
@@ -36,9 +36,12 @@ DecentralizedWrapper
 ├── simulate_visible_neighbors(ego, obs)       # batch neighbors (1 step)
 ├── get_safe_action(obs, do_sample)            # core safety logic
 │   ├── _get_safe_action_single_step()         # horizon=1: hard mask
-│   └── _get_safe_action_multistep()           # horizon>1: cost field
-├── _simulate_hp_trajectories(obs, horizon)    # multi-step neighbor rollout
-├── _build_ego_occupancy(ego, obs, traj)       # per-ego occupancy field
+│   └── _get_safe_action_multistep()           # horizon>1: risk map
+├── _simulate_hp_trajectory_trees(obs, h)      # trajectory tree simulation
+│   └── _simulate_single_agent_tree(...)       # per-agent tree propagation
+├── _build_cumulative_risk_map(ego, obs, traj) # per-ego risk map (Eq. 3)
+├── _propagate_risk(risk_map, target)          # implicit risk propagation (Eq. 4)
+├── _prune_probs(probs)                        # action pruning (Eq. 1)
 ├── _build_sim_input(pos, target, history)     # input at simulated position
 └── _build_input(ego, obs, max_agents, ctx)    # input from real observations
 ```
@@ -60,7 +63,7 @@ The wrapper supports two safety modes controlled by the `horizon` parameter:
 | Mode | `horizon` | Approach | When to use |
 |------|-----------|----------|-------------|
 | Single-step | `1` | Hard mask: zero out conflicting actions | Fast, few agents |
-| Multi-step | `>1` | Soft cost field from probabilistic occupancy | Many agents, dense scenarios |
+| Multi-step | `>1` | Risk map from trajectory tree simulation | Many agents, dense scenarios |
 
 ---
 
@@ -94,93 +97,137 @@ For each agent i (all in parallel):
 
 ---
 
-### Mode 2: Multi-Step Probabilistic Cost Field (`horizon>1`)
+### Mode 2: Risk Map via Trajectory Tree (`horizon>1`)
 
 Single-step is reactive — it only catches imminent collisions. With many agents,
 avoiding a collision at step t often pushes it to step t+1. The multi-step mode
-builds a **probabilistic occupancy field** over future timesteps and penalizes
-actions whose trajectories overlap with it.
+builds a **cumulative risk map** from trajectory tree simulation and selects
+actions that balance policy preference against collision risk.
 
 #### Step 1: Ego Action Probabilities
 
 Run the shared policy on all N agents with full context (13-agent window) in one
 batched forward pass → `P_policy` of shape `(N, 5)`.
 
-#### Step 2: Simulate Higher-Priority Neighbors' Trajectories
+#### Step 2: Simulate Higher-Priority Neighbors' Trajectory Trees (Eq. 1-2)
 
-For each unique higher-priority neighbor, simulate `h` steps forward:
-
-```
-At each step t:
-  1. Run shared policy → full distribution [p_wait, p_up, p_down, p_left, p_right]
-  2. Record occupancy: each reachable cell gets the probability mass
-     of the action leading there
-  3. Advance position by argmax for the next step's simulation
-```
-
-This produces a **soft occupancy field**: cells along the most likely path get
-high probability mass, but adjacent cells also get nonzero mass from alternative
-actions. This is much richer than a deterministic argmax-only prediction.
-
-Example for a neighbor at (3,5) with policy output [0.05, 0.1, 0.7, 0.1, 0.05]:
+For each unique higher-priority neighbor, build a **trajectory tree** for `h`
+steps. Unlike the previous argmax-advance approach, the tree propagates
+probability mass through **all actions above threshold ε**:
 
 ```
+For neighbor p_ℓ at position (i₀, j₀):
+  frontier = {(i₀, j₀): probability 1.0}
+
+  For each step t = 0..h-1:
+    1. Run shared policy at each frontier position
+    2. Prune: zero actions with probability < ε, renormalize (Eq. 1):
+       π̃(a | o) = π(a | o) / Σ_{a': π(a'|o) ≥ ε} π(a' | o)   if π(a | o) ≥ ε
+                 = 0                                              otherwise
+    3. Propagate mass: for each frontier cell and each surviving action,
+       compute next position and accumulate probability mass (Eq. 2):
+       r_{ijt} = Σ_{(i',j') ∈ N(i,j)} r_{i'j',t-1} · π̃(a_{(i',j')→(i,j)} | o)
+    4. Record step occupancy: occupancy[t][(x,y)] = total mass at (x,y)
+    5. New frontier = all cells with nonzero mass
+```
+
+This produces a **full probability distribution over cells** at each timestep,
+not just a single predicted position.
+
+Example for a neighbor at (3,5) with policy [0.05, 0.1, 0.7, 0.1, 0.05] and ε=0.1:
+
+```
+After pruning (ε=0.1): [0, 0.111, 0.778, 0.111, 0]  (wait and right pruned)
 Step t occupancy:
-  (3,5) → 0.05  (wait)
-  (2,5) → 0.10  (up)
-  (4,5) → 0.70  (down)    ← argmax, used to advance
-  (3,4) → 0.10  (left)
-  (3,6) → 0.05  (right)
+  (2,5) → 0.111  (up)
+  (4,5) → 0.778  (down)
+  (3,4) → 0.111  (left)
+
+Next step: frontier has 3 positions, each gets its own policy evaluation
 ```
 
-The neighbor advances to (4,5) for step t+1, but the cost field remembers that
-(2,5), (3,4), and (3,6) each had some probability mass.
+**Action history**: Each frontier position keeps the history from its
+highest-mass predecessor path (simplified tracking).
 
-#### Step 3: Build Per-Ego Occupancy
+**Simulation modes** (`sequential_simulation` parameter):
 
-For each ego agent, sum occupancy probabilities from all its higher-priority
-visible neighbors at each cell and step:
+- **Independent** (`False`, default): All hp neighbors simulated independently.
+  All frontier positions across all agents batched into one forward pass per step.
+- **Sequential** (`True`): Simulate in priority order. Each agent p_k's tree
+  accounts for occupancy from already-simulated p_1..p_{k-1} — actions landing
+  on high-occupancy cells are penalized before tree propagation.
 
-```
-occupancy[t][(x,y)] = Σ_j P(neighbor j at (x,y) at step t)
-```
+#### Step 3: Build Cumulative Risk Map (Eq. 3)
 
-#### Step 4: Simulate Ego Candidate Trajectories
+For each ego agent, aggregate per-neighbor occupancy into a cumulative risk map:
 
-For each of the 5 candidate actions, simulate the ego forward for `h` steps:
-
-```
-For action a ∈ {0,1,2,3,4}:
-  1. Take action a → ego at pos_1
-  2. Run policy at pos_1 → advance by argmax → pos_2
-  3. Repeat for h steps total
-  4. Accumulate danger:
-     danger(a) = Σ_t γ^t · occupancy[t][ego_pos_t(a)]
-```
-
-All N×5 candidate trajectories are batched per step.
-
-#### Step 5: Adjust Probabilities
+1. For each hp neighbor, merge occupancy across all timesteps (max per cell).
+2. Propagate risk along the neighbor's distance-to-goal path (Eq. 4, see below).
+3. Aggregate across neighbors using **element-wise max** (not sum):
 
 ```
-P_adjusted(a) ∝ P_policy(a) · exp(-λ · danger(a))
+R_{ijt} = max_{p_ℓ ∈ P} r_{ijt}^{(p_ℓ)}    ∀ i, j, t
 ```
 
-- High `safety_lambda` → more conservative (stronger avoidance)
-- `gamma` controls how much future danger matters vs. immediate
+The max operation reflects that collision risk is dominated by the single most
+likely conflicting agent, not a sum of independent probabilities.
+
+#### Step 4: Implicit Risk Propagation (Eq. 4)
+
+The raw risk map captures direct occupancy but doesn't account for the likelihood
+that a higher-priority agent will pass through a cell **on its way** to its goal.
+Risk is propagated along each neighbor's distance-to-goal map with decay factor α:
+
+```
+For each cell (i,j) with risk R_{ijt}:
+  For each neighboring cell (x,y) closer to the goal (d_{xy} < d_{ij}):
+    R_{xyt} ← max(R_{xyt}, R_{ijt} · α^{d_{ij} - d_{xy}})
+```
+
+This ensures cells along the agent's likely future path carry risk even if
+they weren't directly in the trajectory tree's horizon.
+
+#### Step 5: Risk-Aware Action Selection (Eq. 5-6)
+
+For each candidate action, compute a cost that balances policy preference against
+collision risk:
+
+```
+c(a) = -λ₁ · log π*(a | oᵢ) + λ₂ · R_{xy,τ+1}
+```
+
+where `-log π*(a | oᵢ)` is the negative log-probability (lower is more preferred)
+and `R_{xy,τ+1}` is the risk at the destination cell. The agent selects:
+
+```
+a* = argmin_{a ∈ A(i,j)} c(a)
+```
+
+- `lambda_1` controls how much the agent follows the learned policy
+- `lambda_2` controls how much the agent avoids risky cells
 
 #### Batching Strategy
 
-All forward passes are batched for efficiency:
+**Independent mode** (`sequential_simulation=False`):
 
 | Pass | Batch size | Count |
 |------|-----------|-------|
 | Ego action probs (full context) | N | 1 |
-| Neighbor trajectory simulation | # unique hp neighbors | h |
-| Ego candidate rollout | N × 5 | h − 1 |
-| **Total forward passes** | | **2h** |
+| Neighbor trajectory tree (all frontiers) | total frontier cells | h |
+| **Total forward passes** | | **h + 1** |
 
-For N=32 agents, h=3: **6 batched forward passes per timestep**.
+**Sequential mode** (`sequential_simulation=True`):
+
+| Pass | Batch size | Count |
+|------|-----------|-------|
+| Ego action probs (full context) | N | 1 |
+| Neighbor trajectory tree (per agent) | per-agent frontier cells | h × K |
+| **Total forward passes** | | **h × K + 1** |
+
+where K = number of unique hp neighbors.
+
+No ego rollout forward passes are needed — the risk map with implicit
+propagation replaces them entirely.
 
 ---
 
@@ -201,7 +248,7 @@ Two `Encoder` instances with different `num_agents` settings:
 | Encoder | `num_agents` | Used for |
 |---------|-------------|----------|
 | `self.encoder` | 13 (default) | Ego agent's own action — full context |
-| `self.sim_encoder` | `sim_num_agents` (default 1) | Simulating neighbors + ego rollout — reduced window |
+| `self.sim_encoder` | `sim_num_agents` (default 1) | Simulating neighbors — reduced window |
 
 **Token count comparison** (with default parameters):
 
@@ -237,7 +284,7 @@ python example_safe.py \
   --horizon 1
 ```
 
-### Tuning multi-step parameters
+### Tuning risk map parameters
 
 ```bash
 python example_safe.py \
@@ -245,9 +292,22 @@ python example_safe.py \
   --num_agents 64 \
   --device mps \
   --horizon 5 \
-  --gamma 0.85 \
-  --safety_lambda 10.0 \
+  --epsilon 0.1 \
+  --alpha 0.5 \
+  --lambda_1 1.0 \
+  --lambda_2 2.0 \
   --priority_scheme random
+```
+
+### Sequential simulation mode
+
+```bash
+python example_safe.py \
+  --model 2M \
+  --num_agents 32 \
+  --device mps \
+  --horizon 3 \
+  --sequential
 ```
 
 ### Programmatic
@@ -262,8 +322,11 @@ wrapper = DecentralizedWrapper(
     priority_scheme="index",
     sim_num_agents=1,
     horizon=3,
-    gamma=0.9,
-    safety_lambda=5.0,
+    epsilon=0.1,
+    alpha=0.5,
+    lambda_1=1.0,
+    lambda_2=1.0,
+    sequential_simulation=False,
 )
 wrapper.reset_states()
 
@@ -301,10 +364,12 @@ neighbor_dict = wrapper.simulate_visible_neighbors(
 |-----------|---------|-------------|
 | `priority_scheme` | `"index"` | `"index"`: agent 0 = highest priority. `"random"`: shuffled at episode start. |
 | `sim_num_agents` | `1` | Agent slots in reduced window for simulation. 1 = only the agent itself. Higher = richer context but slower. |
-| `horizon` | `3` | Steps to simulate forward. 1 = single-step hard mask. >1 = multi-step cost field. |
-| `gamma` | `0.9` | Discount factor for future occupancy danger (0 < gamma <= 1). |
-| `safety_lambda` | `5.0` | Penalty strength. `P(a) ∝ P_policy(a) · exp(-λ · danger(a))`. Higher = more conservative. |
-| `do_sample` | `True` | Sample from adjusted distribution vs. argmax. |
+| `horizon` | `3` | Steps to simulate forward. 1 = single-step hard mask. >1 = risk map approach. |
+| `epsilon` | `0.1` | Pruning threshold for trajectory tree. Actions below this probability are dropped (Eq. 1). |
+| `alpha` | `0.5` | Decay factor for implicit risk propagation along distance-to-goal paths (Eq. 4). |
+| `lambda_1` | `1.0` | Weight for policy log-probability in cost function. Higher = follow policy more (Eq. 5). |
+| `lambda_2` | `1.0` | Weight for risk map in cost function. Higher = more conservative avoidance (Eq. 5). |
+| `sequential_simulation` | `False` | If True, simulate hp neighbors in priority order with mutual avoidance. |
 
 ## Limitations and Future Work
 
@@ -314,16 +379,17 @@ neighbor_dict = wrapper.simulate_visible_neighbors(
 
 2. **Compounding prediction error**: Each simulation step builds on the previous
    step's predicted position. By step h, the predicted trajectory may diverge from
-   reality. In practice h=3–5 is a sweet spot.
+   reality. Probability pruning (ε) helps control tree growth but the frontier
+   can still drift. In practice h=3–5 is a sweet spot.
 
-3. **Argmax trajectory, soft occupancy**: Neighbor trajectories advance by argmax
-   (most likely action), but the occupancy field records the full distribution at
-   each step. A tree-based approach (branching on all actions) would be more
-   accurate but exponentially more expensive.
-
-4. **Same-priority conflicts**: Agents only yield to strictly higher-priority
+3. **Same-priority conflicts**: Agents only yield to strictly higher-priority
    neighbors. Two agents with adjacent priorities that can't see each other may
    still collide. This is inherent to the decentralized setting.
+
+4. **Simplified action history in tree**: Each frontier position keeps the history
+   from its highest-mass predecessor. Different paths to the same cell may have
+   different histories; we approximate with the dominant one. The cost2go grid
+   dominates the policy's spatial reasoning, so this has marginal impact.
 
 5. **Static other-agent positions during simulation**: When simulating a neighbor
    forward, other agents' positions are not updated (they stay at their t=0
@@ -335,6 +401,7 @@ neighbor_dict = wrapper.simulate_visible_neighbors(
 Branch: `feat/safe-action-wrapper`
 
 ```
+fb1637f docs: Update design doc with multi-step cost field approach
 3797d9e feat: Add multi-step probabilistic occupancy cost field
 fb638a9 refactor: Make all agents commit simultaneously, priority as tie-breaker only
 7d24a7c feat: Rewrite as fully decentralized wrapper with fixed priorities
