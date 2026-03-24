@@ -27,8 +27,8 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             end_index = start_index + files_per_worker
             self.file_paths = self.file_paths[start_index:end_index]
 
-        # pre-allocate memory for the input and target tensors (same file size)
-        sample_input_tensors, sample_gt_actions = self._get_data_from_file(self.file_paths[0])
+        # Pre-allocate from first file; rows may differ across shards (e.g. PIBT chunks) — resize in load_and_transfer_data_file.
+        sample_input_tensors, _ = self._get_data_from_file(self.file_paths[0])
 
         self.input_tensors = torch.empty(sample_input_tensors.shape, dtype=self.dtype, device=self.device)
         self.target_tensors = torch.full(sample_input_tensors.shape, -1, dtype=self.dtype, device=self.device)
@@ -49,10 +49,21 @@ class MapfArrowDataset(torch.utils.data.Dataset):
 
         return input_tensors, gt_actions
 
+    @staticmethod
+    def _count_rows_in_file(file_path):
+        with pa.memory_map(file_path) as source:
+            reader = pa.ipc.open_file(source)
+            return sum(reader.get_batch(i).num_rows for i in range(reader.num_record_batches))
+
     def load_and_transfer_data_file(self, filename):
         start_time = time.monotonic()
 
         input_tensors, gt_actions = self._get_data_from_file(filename)
+
+        n = input_tensors.shape[0]
+        if n != self.input_tensors.shape[0]:
+            self.input_tensors = torch.empty(input_tensors.shape, dtype=self.dtype, device=self.device)
+            self.target_tensors = torch.full(input_tensors.shape, -1, dtype=self.dtype, device=self.device)
 
         self.input_tensors.copy_(torch.tensor(input_tensors, dtype=self.dtype), non_blocking=True)
         self.target_tensors[:, -1].copy_(torch.tensor(gt_actions, dtype=self.dtype), non_blocking=True)
@@ -67,10 +78,10 @@ class MapfArrowDataset(torch.utils.data.Dataset):
                     yield self.input_tensors[i:i + self.batch_size], self.target_tensors[i:i + self.batch_size]
 
     def get_shard_size(self):
-        return len(self.input_tensors) * len(self.file_paths)
+        return sum(self._count_rows_in_file(p) for p in self.file_paths)
 
     def get_full_dataset_size(self):
-        return len(self.input_tensors) * len(self.all_data_files)
+        return sum(self._count_rows_in_file(p) for p in self.all_data_files)
 
 
 def main():

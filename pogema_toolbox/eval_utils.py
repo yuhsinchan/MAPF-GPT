@@ -6,15 +6,17 @@ import wandb
 
 
 def initialize_wandb(evaluation_config, eval_dir, disable_wandb, project_name):
-    mode = 'disabled' if disable_wandb else 'online'
+    if disable_wandb:
+        return
     wandb.init(project=project_name, anonymous="allow", config=evaluation_config,
-               mode=mode, job_type=eval_dir.stem, group='eval')
+               mode='online', job_type=eval_dir.stem, group='eval')
 
 
 def save_evaluation_results(eval_dir):
-    zip_path = f"{eval_dir}.zip"
     shutil.make_archive(str(eval_dir), 'zip', eval_dir)
-    wandb.save(str(zip_path), )
+    if wandb.run is not None:
+        zip_path = f"{eval_dir}.zip"
+        wandb.save(str(zip_path))
 
 
 def create_and_push_summary_archive(folder_names, base_path, project_name, archive_name='eval_summary'):

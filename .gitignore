@@ -208,3 +208,11 @@ __marimo__/
 
 .DS_Store
 
+
+dataset_pibt_48agents/
+out/
+wandb/
+weights/
+PIBT_Distill_data/
+tokenizer/.rendered.*.cpp
+

@@ -27,7 +27,8 @@ eval_interval = 500
 log_interval = 1
 eval_iters = 40
 always_save_checkpoint = True  # if True, always save a checkpoint after each eval
-init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
+init_from = "scratch"  # 'scratch', 'resume', or 'pretrained' (HF-style ckpt: model + model_args)
+pretrained_path = "weights/model-2M.pt"  # used when init_from == "pretrained"
 # wandb logging
 wandb_log = False  # disabled by default
 wandb_project = "mapf-gpt"
@@ -170,6 +171,14 @@ best_val_loss = 1e9
 
 meta_vocab_size = len(tokenizer.encoder.vocab)
 
+def _strip_orig_mod_prefix(state_dict):
+    prefix = "_orig_mod."
+    for k, v in list(state_dict.items()):
+        if k.startswith(prefix):
+            state_dict[k[len(prefix) :]] = state_dict.pop(k)
+    return state_dict
+
+
 # model init
 model_args = dict(
     n_layer=n_layer,
@@ -186,6 +195,16 @@ if init_from == "scratch":
     model_args["vocab_size"] = meta_vocab_size
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+elif init_from == "pretrained":
+    logger.info(f"Initializing from pretrained checkpoint {pretrained_path}")
+    checkpoint = torch.load(pretrained_path, map_location=device)
+    checkpoint_model_args = checkpoint["model_args"]
+    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
+        model_args[k] = checkpoint_model_args[k]
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    state_dict = _strip_orig_mod_prefix(checkpoint["model"])
+    model.load_state_dict(state_dict, strict=False)
 elif init_from == "resume":
     logger.info(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
