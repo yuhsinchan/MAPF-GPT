@@ -125,6 +125,17 @@ def parse_args():
         action="store_true",
         help="Simulate hp neighbors in priority order (default: independent).",
     )
+    p.add_argument(
+        "--conflict_radius",
+        type=int,
+        default=None,
+        help=(
+            "Chebyshev radius for trajectory tree simulation. Only hp neighbors "
+            "within this distance trigger forward passes. Agents between "
+            "conflict_radius and agents_radius are still in the ego context window "
+            "but generate no simulation cost. None = use agents_radius (no filter)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -147,6 +158,7 @@ def build_safe_algo_entry(baseline_entry: dict, args) -> dict:
         "lambda_1": args.lambda_1,
         "lambda_2": args.lambda_2,
         "sequential_simulation": args.sequential_simulation,
+        "conflict_radius": args.conflict_radius,
     }
     return entry
 

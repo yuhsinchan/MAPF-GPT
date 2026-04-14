@@ -64,6 +64,7 @@ class MockWrapper(DecentralizedWrapper):
         self.lambda_1 = kwargs.get("lambda_1", 1.0)
         self.lambda_2 = kwargs.get("lambda_2", 1.0)
         self.sequential_simulation = kwargs.get("sequential_simulation", False)
+        self.conflict_radius = kwargs.get("conflict_radius", cfg.agents_radius)
 
         self.net = None
         self.encoder = _make_encoder(cfg, cfg.num_agents)

@@ -169,6 +169,7 @@ class DecentralizedWrapper:
         lambda_1: float = 1.0,
         lambda_2: float = 1.0,
         sequential_simulation: bool = False,
+        conflict_radius: Optional[int] = None,
     ):
         """
         Args:
@@ -192,6 +193,13 @@ class DecentralizedWrapper:
             sequential_simulation: If True, simulate hp neighbors in
                 priority order where each agent avoids occupancy from
                 higher-priority agents. If False, simulate independently.
+            conflict_radius: Chebyshev distance threshold for trajectory
+                tree simulation. Only hp neighbors within this radius
+                trigger a tree simulation. Agents between conflict_radius
+                and agents_radius are still included in the ego's context
+                window for action probability computation, but do not
+                generate forward passes. None = use agents_radius (no filter).
+                Smaller values reduce forward passes in sparse scenarios.
         """
         self.cfg = cfg
         self.priority_scheme = priority_scheme
@@ -202,6 +210,7 @@ class DecentralizedWrapper:
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.sequential_simulation = sequential_simulation
+        self.conflict_radius = conflict_radius if conflict_radius is not None else cfg.agents_radius
 
         self.net = _load_model(cfg)
         self.encoder = _make_encoder(cfg, cfg.num_agents)
@@ -432,12 +441,29 @@ class DecentralizedWrapper:
         return pruned / totals
 
     def _collect_hp_neighbors(self, observations) -> set:
-        """Collect all unique higher-priority neighbors across all egos."""
+        """
+        Collect all unique higher-priority neighbors that are close enough
+        to warrant trajectory tree simulation.
+
+        Uses conflict_radius (≤ agents_radius) rather than the full
+        agents_radius so that distant-but-visible hp neighbors don't
+        generate unnecessary forward passes. The ego's context window
+        (for its own action probs) still uses the full agents_radius.
+        """
         hp_neighbors = set()
+        r = self.conflict_radius
         for ego_idx in range(self.num_agents):
-            visible = self._get_visible_neighbors(ego_idx, observations)
-            for n in visible:
-                if self.priorities[n] < self.priorities[ego_idx]:
+            ego_pos = observations[ego_idx]["global_xy"]
+            for n in range(self.num_agents):
+                if n == ego_idx:
+                    continue
+                if self.priorities[n] >= self.priorities[ego_idx]:
+                    continue
+                other_pos = observations[n]["global_xy"]
+                if (
+                    abs(other_pos[0] - ego_pos[0]) <= r
+                    and abs(other_pos[1] - ego_pos[1]) <= r
+                ):
                     hp_neighbors.add(n)
         return hp_neighbors
 
@@ -1088,6 +1114,7 @@ class DecentralizedWrapperConfig(AlgoBase, extra=Extra.forbid):
     lambda_1: float = 1.0
     lambda_2: float = 1.0
     sequential_simulation: bool = False
+    conflict_radius: Optional[int] = None  # None = use agents_radius
 
 
 class DecentralizedWrapperAlgo:
@@ -1126,6 +1153,7 @@ class DecentralizedWrapperAlgo:
             lambda_1=cfg.lambda_1,
             lambda_2=cfg.lambda_2,
             sequential_simulation=cfg.sequential_simulation,
+            conflict_radius=cfg.conflict_radius,
         )
 
     def act(self, observations):
