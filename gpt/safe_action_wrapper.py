@@ -1124,6 +1124,9 @@ class DecentralizedWrapperAlgo:
 
     Registered under the name "MAPF-GPT-Safe" so benchmark YAML files can
     refer to it alongside "MAPF-GPT".
+
+    Also tracks vertex/edge collisions each step via count_collisions().
+    Call get_extra_metrics() after an episode to retrieve per-episode totals.
     """
 
     def __init__(self, cfg: DecentralizedWrapperConfig):
@@ -1155,9 +1158,26 @@ class DecentralizedWrapperAlgo:
             sequential_simulation=cfg.sequential_simulation,
             conflict_radius=cfg.conflict_radius,
         )
+        self._collision_vertex: int = 0
+        self._collision_edge: int = 0
 
     def act(self, observations):
-        return self._wrapper.act(observations)
+        positions = [tuple(o["global_xy"]) for o in observations]
+        actions = self._wrapper.act(observations)
+        stats = count_collisions(positions, actions)
+        self._collision_vertex += stats["vertex"]
+        self._collision_edge += stats["edge"]
+        return actions
 
     def reset_states(self):
+        self._collision_vertex = 0
+        self._collision_edge = 0
         return self._wrapper.reset_states()
+
+    def get_extra_metrics(self) -> dict:
+        """Return per-episode collision totals to be merged into benchmark metrics."""
+        return {
+            "collision_vertex": self._collision_vertex,
+            "collision_edge": self._collision_edge,
+            "collision_total": self._collision_vertex + self._collision_edge,
+        }

@@ -41,7 +41,11 @@ def run_episode(env, algo):
 
         if all(terminated) or all(truncated):
             break
-    return results_holder.get_final()
+    final = results_holder.get_final()
+    # Merge any extra metrics the algorithm wants to report (e.g. collision counts).
+    if callable(getattr(algo, "get_extra_metrics", None)):
+        final.update(algo.get_extra_metrics())
+    return final
 
 
 def sequential_backend(algo_config, env_configs, full_algo_name, registry_state=None):

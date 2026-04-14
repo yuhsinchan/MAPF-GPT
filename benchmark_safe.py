@@ -25,7 +25,9 @@ All wrapper hyperparameters correspond directly to DecentralizedWrapperConfig fi
 """
 
 import argparse
+import collections
 import copy
+import json
 from pathlib import Path
 
 import yaml
@@ -232,6 +234,55 @@ def main():
         initialize_wandb(evaluation_config, eval_dir, args.disable_wandb, PROJECT_NAME)
         evaluation(evaluation_config, eval_dir=eval_dir)
         save_evaluation_results(eval_dir)
+
+    print_collision_summary(args.folders)
+
+
+def print_collision_summary(folders):
+    """
+    Read per-algo JSON result files and print a summary table of collision stats.
+    Only shows algorithms that have collision metrics (i.e. Safe variants).
+    """
+    COLLISION_KEYS = ("collision_vertex", "collision_edge", "collision_total")
+
+    # Accumulate stats: algo -> num_agents -> list of per-episode values
+    stats: dict = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.defaultdict(list)))
+
+    for folder in folders:
+        eval_dir = BASE_PATH / folder
+        for json_file in sorted(eval_dir.glob("*.json")):
+            with open(json_file) as f:
+                results = json.load(f)
+            for entry in results:
+                metrics = entry.get("metrics", {})
+                if not any(k in metrics for k in COLLISION_KEYS):
+                    continue
+                algo = entry.get("algorithm", json_file.stem)
+                num_agents = entry.get("env_grid_search", {}).get("num_agents", "?")
+                for k in COLLISION_KEYS:
+                    if k in metrics:
+                        stats[algo][num_agents][k].append(metrics[k])
+
+    if not stats:
+        print("\n[Collision Summary] No collision metrics found (only Safe variants track collisions).")
+        return
+
+    print("\n" + "=" * 72)
+    print("Collision Summary (mean per episode)")
+    print("=" * 72)
+    header = f"{'Algorithm':<20} {'agents':>6}  {'vertex':>8}  {'edge':>8}  {'total':>8}"
+    print(header)
+    print("-" * 72)
+    for algo in sorted(stats):
+        for num_agents in sorted(stats[algo]):
+            row = stats[algo][num_agents]
+            def mean(vals):
+                return sum(vals) / len(vals) if vals else float("nan")
+            v = mean(row.get("collision_vertex", []))
+            e = mean(row.get("collision_edge", []))
+            t = mean(row.get("collision_total", []))
+            print(f"{algo:<20} {num_agents:>6}  {v:>8.2f}  {e:>8.2f}  {t:>8.2f}")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
