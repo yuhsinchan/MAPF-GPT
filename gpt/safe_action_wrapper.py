@@ -812,14 +812,19 @@ class DecentralizedWrapper:
         # The ego takes one action and arrives at next_pos at t=1, so we
         # check risk at t=1 only — avoids penalizing cells that are only
         # risky at future timesteps the ego won't reach in one step.
+        #
+        # Costs are converted to a sampling distribution via softmin:
+        #   weight(a) = exp(-c(a)) = π(a)^λ₁ · exp(-λ₂ · R[dest(a)])
+        # When do_sample=True this distribution is sampled, giving the same
+        # stochasticity as the baseline policy while still down-weighting
+        # risky actions. When do_sample=False the minimum-cost action is taken.
         final_actions = []
         for ego_idx in range(self.num_agents):
             ego_pos = positions[ego_idx]
             probs = all_probs[ego_idx]
             risk_t1 = ego_risk_maps[ego_idx].get(1, {})
 
-            best_action = 0
-            best_cost = float('inf')
+            weights = torch.zeros(5)
             for a in range(5):
                 p = probs[a].item()
                 if p < 1e-8:
@@ -828,11 +833,9 @@ class DecentralizedWrapper:
                 log_prob = -torch.log(probs[a]).item()
                 risk_at_dest = risk_t1.get(next_pos, 0.0)
                 cost = self.lambda_1 * log_prob + self.lambda_2 * risk_at_dest
-                if cost < best_cost:
-                    best_cost = cost
-                    best_action = a
+                weights[a] = torch.exp(torch.tensor(-cost))
 
-            final_actions.append(best_action)
+            final_actions.append(self._sample_action(weights, do_sample))
 
         return final_actions
 
