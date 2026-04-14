@@ -13,9 +13,12 @@ Key assumptions:
   lower-priority agents must yield.
 """
 
+import heapq
+import math
 from typing import Dict, List, Literal, Optional
 
 import cppimport.import_hook
+import numpy as np
 import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
@@ -412,6 +415,22 @@ class DecentralizedWrapper:
             return pruned / total
         return probs  # fallback: no pruning if all below epsilon
 
+    def _prune_probs_batch(self, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Batched version of _prune_probs for shape (N, 5).
+
+        Avoids per-row Python loops — the entire batch is pruned and
+        renormalized in two tensor ops.
+        """
+        mask = probs >= self.epsilon
+        pruned = probs * mask
+        totals = pruned.sum(dim=-1, keepdim=True)
+        # Where everything was pruned, fall back to the original distribution
+        fallback = totals == 0
+        pruned = torch.where(fallback.expand_as(pruned), probs, pruned)
+        totals = pruned.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        return pruned / totals
+
     def _collect_hp_neighbors(self, observations) -> set:
         """Collect all unique higher-priority neighbors across all egos."""
         hp_neighbors = set()
@@ -433,9 +452,9 @@ class DecentralizedWrapper:
         """
         Simulate one agent's trajectory tree for h steps (Eq. 2).
 
-        Propagates probability mass through all actions above epsilon.
-        Uses simplified history: each frontier position keeps the history
-        from its highest-mass predecessor.
+        Used only in sequential mode (prior_occupancy != None).
+        In independent mode, _simulate_hp_trajectory_trees handles all
+        agents together in one batched forward pass per step.
 
         Args:
             start_pos: Agent's starting position.
@@ -468,33 +487,30 @@ class DecentralizedWrapper:
             ]
 
             # One batched forward pass for this agent's frontier
-            all_probs = self._forward_batch(inputs, self.sim_encoder)
+            raw_probs = self._forward_batch(inputs, self.sim_encoder)
 
-            # Propagate mass through surviving actions
+            # In sequential mode, apply prior-occupancy penalty before pruning
+            if prior_occupancy is not None and t < len(prior_occupancy):
+                adjusted = raw_probs.clone()
+                for idx, (pos, (mass, hist)) in enumerate(frontier_items):
+                    for a in range(5):
+                        occ_risk = prior_occupancy[t].get(_apply_pos(pos, a), 0.0)
+                        if occ_risk > 0:
+                            adjusted[idx, a] *= (1.0 - occ_risk)
+                row_sums = adjusted.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                raw_probs = adjusted / row_sums
+
+            # Prune and renormalize the entire batch at once, then transfer to
+            # numpy once to avoid per-element .item() overhead
+            all_pruned_np = self._prune_probs_batch(raw_probs).cpu().numpy()
+
             new_frontier: Dict[tuple, tuple] = {}
             step_occ: Dict[tuple, float] = {}
 
             for idx, (pos, (mass, hist)) in enumerate(frontier_items):
-                probs = all_probs[idx]
-
-                # In sequential mode, penalize actions landing on
-                # higher-priority agents' occupancy
-                if prior_occupancy is not None and t < len(prior_occupancy):
-                    adjusted = probs.clone()
-                    for a in range(5):
-                        next_p = _apply_pos(pos, a)
-                        occ_risk = prior_occupancy[t].get(next_p, 0.0)
-                        if occ_risk > 0:
-                            adjusted[a] = adjusted[a] * (1.0 - occ_risk)
-                    # Renormalize after penalty
-                    adj_total = adjusted.sum()
-                    if adj_total > 0:
-                        probs = adjusted / adj_total
-
-                pruned = self._prune_probs(probs)
-
+                pruned = all_pruned_np[idx]
                 for a in range(5):
-                    p = pruned[a].item()
+                    p = float(pruned[a])
                     if p < 1e-8:
                         continue
                     next_pos = _apply_pos(pos, a)
@@ -523,34 +539,85 @@ class DecentralizedWrapper:
         """
         Simulate all unique higher-priority neighbors' trajectory trees.
 
-        In independent mode: all neighbors simulated independently.
-        In sequential mode: neighbors simulated in priority order,
-        each accounting for higher-priority agents' occupancy.
+        Independent mode: all agents' frontiers are batched into ONE forward
+        pass per horizon step (h+1 total passes including the ego pass).
+        This is the primary performance optimization vs. the naive K*h passes.
+
+        Sequential mode: simulate in priority order using _simulate_single_agent_tree
+        so each agent can penalize actions that land on higher-priority occupancy.
 
         Returns:
             Dict[neighbor_idx -> list of h occupancy dicts].
-            Each occupancy dict maps (x, y) -> probability mass.
         """
         all_hp_neighbors = self._collect_hp_neighbors(observations)
         if not all_hp_neighbors:
             return {}
 
-        # Sort by priority (highest priority = lowest value first)
         hp_list = sorted(all_hp_neighbors, key=lambda n: self.priorities[n])
-
         trajectories: Dict[int, List[Dict[tuple, float]]] = {}
 
         if not self.sequential_simulation:
-            # Independent mode: batch all agents' frontiers together per step
-            # For simplicity, simulate each agent's tree separately but
-            # batch the forward passes across all agents at each step
+            # ---- Independent mode: one forward pass per horizon step ----
+            # Initialize a frontier per hp agent: pos -> (mass, history)
+            frontiers: Dict[int, Dict[tuple, tuple]] = {}
+            agent_targets: Dict[int, tuple] = {}
             for n in hp_list:
                 pos = tuple(observations[n]["global_xy"])
                 target = tuple(observations[n]["global_target_xy"])
-                history = list(self.action_histories[n])
-                trajectories[n] = self._simulate_single_agent_tree(
-                    pos, target, history, horizon
-                )
+                frontiers[n] = {pos: (1.0, list(self.action_histories[n]))}
+                agent_targets[n] = target
+                trajectories[n] = []
+
+            for t in range(horizon):
+                # Collect ALL frontier cells from ALL agents into one batch
+                batch_inputs = []
+                batch_meta: List[tuple] = []  # (agent_n, pos, mass, hist)
+                for n in hp_list:
+                    target = agent_targets[n]
+                    for pos, (mass, hist) in frontiers[n].items():
+                        batch_inputs.append(self._build_sim_input(pos, target, hist))
+                        batch_meta.append((n, pos, mass, hist))
+
+                if not batch_inputs:
+                    for n in hp_list:
+                        trajectories[n].append({})
+                    continue
+
+                # ONE forward pass for all agents' frontiers at this step
+                raw_probs = self._forward_batch(batch_inputs, self.sim_encoder)
+                # Prune entire batch + transfer to numpy once (avoids .item() overhead)
+                all_pruned_np = self._prune_probs_batch(raw_probs).cpu().numpy()
+
+                new_frontiers: Dict[int, Dict[tuple, tuple]] = {n: {} for n in hp_list}
+                step_occs: Dict[int, Dict[tuple, float]] = {n: {} for n in hp_list}
+
+                for idx, (n, pos, mass, hist) in enumerate(batch_meta):
+                    pruned = all_pruned_np[idx]
+                    step_occ = step_occs[n]
+                    new_frontier = new_frontiers[n]
+                    for a in range(5):
+                        p = float(pruned[a])
+                        if p < 1e-8:
+                            continue
+                        next_pos = _apply_pos(pos, a)
+                        transition_mass = mass * p
+                        step_occ[next_pos] = step_occ.get(next_pos, 0.0) + transition_mass
+                        new_hist = (hist + [MOVES_STR[a]])[-self.cfg.num_previous_actions:]
+                        if next_pos in new_frontier:
+                            ex_mass, ex_hist = new_frontier[next_pos]
+                            new_frontier[next_pos] = (
+                                ex_mass + transition_mass,
+                                new_hist if transition_mass > ex_mass else ex_hist,
+                            )
+                        else:
+                            new_frontier[next_pos] = (transition_mass, new_hist)
+
+                for n in hp_list:
+                    trajectories[n].append(step_occs[n])
+                    frontiers[n] = new_frontiers[n]
+
+            return trajectories
+
         else:
             # Sequential mode: simulate in priority order
             # Each agent sees the cumulative occupancy from higher-priority agents
@@ -593,8 +660,6 @@ class DecentralizedWrapper:
         back onto the heap, giving transitive propagation in one pass without
         re-iterating the full cell list.
         """
-        import heapq
-
         d = self.cost2go_data[target]
         propagated = dict(risk_map)
 
@@ -818,22 +883,27 @@ class DecentralizedWrapper:
         # When do_sample=True this distribution is sampled, giving the same
         # stochasticity as the baseline policy while still down-weighting
         # risky actions. When do_sample=False the minimum-cost action is taken.
+        #
+        # Vectorized: convert all_probs to numpy once, do dict lookups and
+        # math in Python/numpy, build the weight tensor in one shot.
+        all_probs_np = all_probs.cpu().numpy()  # (N, 5) — one transfer for all agents
+        log_probs_np = -np.log(np.clip(all_probs_np, 1e-8, None))  # (N, 5)
+
         final_actions = []
         for ego_idx in range(self.num_agents):
             ego_pos = positions[ego_idx]
-            probs = all_probs[ego_idx]
             risk_t1 = ego_risk_maps[ego_idx].get(1, {})
+            p_row = all_probs_np[ego_idx]   # (5,) numpy
+            lp_row = log_probs_np[ego_idx]  # (5,) numpy
 
             weights = torch.zeros(5)
             for a in range(5):
-                p = probs[a].item()
-                if p < 1e-8:
+                if p_row[a] < 1e-8:
                     continue
                 next_pos = _apply_pos(ego_pos, a)
-                log_prob = -torch.log(probs[a]).item()
                 risk_at_dest = risk_t1.get(next_pos, 0.0)
-                cost = self.lambda_1 * log_prob + self.lambda_2 * risk_at_dest
-                weights[a] = torch.exp(torch.tensor(-cost))
+                cost = self.lambda_1 * float(lp_row[a]) + self.lambda_2 * risk_at_dest
+                weights[a] = math.exp(-cost)
 
             final_actions.append(self._sample_action(weights, do_sample))
 

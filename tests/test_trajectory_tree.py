@@ -93,6 +93,7 @@ def test_trajectory_tree():
     mock._build_sim_input = types.MethodType(_build_sim_input, mock)
     mock._forward_batch = types.MethodType(_forward_batch, mock)
     mock._prune_probs = types.MethodType(DecentralizedWrapper._prune_probs, mock)
+    mock._prune_probs_batch = types.MethodType(DecentralizedWrapper._prune_probs_batch, mock)
 
     occupancy = DecentralizedWrapper._simulate_single_agent_tree(
         mock,
