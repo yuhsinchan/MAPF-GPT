@@ -973,3 +973,93 @@ class DecentralizedWrapper:
             "priorities": self.priorities,
             "next_positions": next_positions,
         }
+
+
+# ---------------------------------------------------------------------------
+# Toolbox-compatible config and adapter for benchmark registration
+# ---------------------------------------------------------------------------
+
+from pogema_toolbox.algorithm_config import AlgoBase
+from pydantic import Extra
+
+
+class DecentralizedWrapperConfig(AlgoBase, extra=Extra.forbid):
+    """
+    Pydantic config for DecentralizedWrapper that can be registered with
+    ToolboxRegistry and used in benchmark YAML files.
+
+    Combines all MAPFGPTInferenceConfig fields (model weights, device, etc.)
+    with the wrapper-specific hyperparameters so a single config object
+    describes the full algorithm.
+    """
+
+    name: Literal["MAPF-GPT-Safe"] = "MAPF-GPT-Safe"
+
+    # ---- model fields (mirrors MAPFGPTInferenceConfig) ----
+    num_agents: int = 13
+    num_previous_actions: int = 5
+    cost2go_value_limit: int = 20
+    agents_radius: int = 5
+    cost2go_radius: int = 5
+    path_to_weights: Optional[str] = "weights/model-2M.pt"
+    context_size: int = 256
+    mask_actions_history: bool = False
+    mask_goal: bool = False
+    mask_cost2go: bool = False
+    mask_greed_action: bool = False
+    repo_id: str = "aandreychuk/MAPF-GPT"
+
+    # ---- wrapper-specific fields ----
+    priority_scheme: Literal["index", "random"] = "index"
+    sim_num_agents: int = 1
+    horizon: int = 3
+    epsilon: float = 0.1
+    alpha: float = 0.5
+    lambda_1: float = 1.0
+    lambda_2: float = 1.0
+    sequential_simulation: bool = False
+
+
+class DecentralizedWrapperAlgo:
+    """
+    Thin adapter that wraps DecentralizedWrapper with the act() / reset_states()
+    interface expected by the pogema-toolbox evaluator.
+
+    Registered under the name "MAPF-GPT-Safe" so benchmark YAML files can
+    refer to it alongside "MAPF-GPT".
+    """
+
+    def __init__(self, cfg: DecentralizedWrapperConfig):
+        mapf_cfg = MAPFGPTInferenceConfig(
+            name="MAPF-GPT",
+            num_agents=cfg.num_agents,
+            num_previous_actions=cfg.num_previous_actions,
+            cost2go_value_limit=cfg.cost2go_value_limit,
+            agents_radius=cfg.agents_radius,
+            cost2go_radius=cfg.cost2go_radius,
+            path_to_weights=cfg.path_to_weights,
+            device=cfg.device,
+            context_size=cfg.context_size,
+            mask_actions_history=cfg.mask_actions_history,
+            mask_goal=cfg.mask_goal,
+            mask_cost2go=cfg.mask_cost2go,
+            mask_greed_action=cfg.mask_greed_action,
+            repo_id=cfg.repo_id,
+        )
+        self._wrapper = DecentralizedWrapper(
+            mapf_cfg,
+            priority_scheme=cfg.priority_scheme,
+            sim_num_agents=cfg.sim_num_agents,
+            horizon=cfg.horizon,
+            epsilon=cfg.epsilon,
+            alpha=cfg.alpha,
+            lambda_1=cfg.lambda_1,
+            lambda_2=cfg.lambda_2,
+            sequential_simulation=cfg.sequential_simulation,
+        )
+
+    def act(self, observations):
+        return self._wrapper.act(observations)
+
+    def reset_states(self):
+        return self._wrapper.reset_states()
