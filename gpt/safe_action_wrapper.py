@@ -588,22 +588,35 @@ class DecentralizedWrapper:
         For each risky cell (i,j), spread risk to cells (x,y) that are
         closer to the goal: R[x,y] <- max(R[x,y], R[i,j] * alpha^(d_ij - d_xy))
 
-        Only propagates toward the goal (decreasing distance), modeling
-        the likely future path of a higher-priority agent.
+        Uses a max-heap (by distance-to-goal) so cells are processed from
+        farthest to closest. When a neighbor's risk is updated it is pushed
+        back onto the heap, giving transitive propagation in one pass without
+        re-iterating the full cell list.
         """
+        import heapq
+
         d = self.cost2go_data[target]
         propagated = dict(risk_map)
 
-        # Process cells in decreasing distance order (far from goal first)
-        # so propagated risk flows toward the goal
-        cells = []
+        # Seed heap with all risky cells.  Heap stores (-dist, i, j) so the
+        # cell farthest from the goal is always popped first.
+        heap = []
         for (i, j), risk in risk_map.items():
             dist = d[i][j]
             if dist >= 0 and risk > 1e-8:
-                cells.append(((i, j), risk, dist))
-        cells.sort(key=lambda x: -x[2])
+                heapq.heappush(heap, (-dist, i, j))
 
-        for (i, j), risk, d_ij in cells:
+        while heap:
+            neg_d_ij, i, j = heapq.heappop(heap)
+            d_ij = -neg_d_ij
+
+            # A cell may have been pushed multiple times; use the current
+            # (highest) risk value rather than the stale one from when it
+            # was pushed.
+            risk = propagated.get((i, j), 0.0)
+            if risk < 1e-8:
+                continue
+
             for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 x, y = i + dx, j + dy
                 try:
@@ -613,25 +626,27 @@ class DecentralizedWrapper:
                 if d_xy < 0 or d_xy >= d_ij:
                     continue
                 propagated_risk = risk * (self.alpha ** (d_ij - d_xy))
-                if propagated_risk > 1e-8:
-                    propagated[(x, y)] = max(
-                        propagated.get((x, y), 0.0), propagated_risk
-                    )
+                if propagated_risk > 1e-8 and propagated_risk > propagated.get((x, y), 0.0):
+                    propagated[(x, y)] = propagated_risk
+                    heapq.heappush(heap, (-d_xy, x, y))
 
         return propagated
 
     def _build_cumulative_risk_map(
         self, ego_idx: int, observations, trajectories: dict
-    ) -> Dict[tuple, float]:
+    ) -> Dict[int, Dict[tuple, float]]:
         """
         Build per-ego cumulative risk map from higher-priority neighbors (Eq. 3).
 
         For each hp neighbor visible to ego:
-        1. Propagate that neighbor's occupancy along its goal direction.
-        2. Aggregate across neighbors using element-wise max.
+        1. Keep occupancy per timestep (not collapsed).
+        2. Propagate each timestep's occupancy along the neighbor's goal direction.
+        3. Aggregate across neighbors using element-wise max per timestep.
 
         Returns:
-            Dict[(x,y) -> risk]. Covers all timesteps, already propagated.
+            Dict[timestep -> Dict[(x,y) -> risk]], timestep is 1-indexed (1..h).
+            Preserves the temporal dimension so the cost function can check risk
+            at the exact timestep the ego would arrive at a destination cell.
         """
         visible = self._get_visible_neighbors(ego_idx, observations)
         hp_neighbors = [
@@ -642,25 +657,18 @@ class DecentralizedWrapper:
         if not hp_neighbors:
             return {}
 
-        cumulative_risk: Dict[tuple, float] = {}
+        cumulative_risk: Dict[int, Dict[tuple, float]] = {}
 
         for n in hp_neighbors:
             n_target = tuple(observations[n]["global_target_xy"])
-            # Merge all timesteps for this neighbor into a single risk map
-            # (take max across timesteps for each cell)
-            neighbor_risk: Dict[tuple, float] = {}
-            for step_occ in trajectories[n]:
-                for cell, prob in step_occ.items():
-                    neighbor_risk[cell] = max(
-                        neighbor_risk.get(cell, 0.0), prob
-                    )
-            # Propagate along this neighbor's goal direction
-            propagated = self._propagate_risk(neighbor_risk, n_target)
-            # Aggregate with max across neighbors (Eq. 3)
-            for cell, risk in propagated.items():
-                cumulative_risk[cell] = max(
-                    cumulative_risk.get(cell, 0.0), risk
-                )
+            for t_idx, step_occ in enumerate(trajectories[n]):
+                t = t_idx + 1  # 1-indexed: step 1 = ego's immediate next position
+                # Propagate this timestep's occupancy along the neighbor's goal path
+                propagated = self._propagate_risk(step_occ, n_target)
+                # Aggregate across neighbors with element-wise max (Eq. 3)
+                t_risk = cumulative_risk.setdefault(t, {})
+                for cell, risk in propagated.items():
+                    t_risk[cell] = max(t_risk.get(cell, 0.0), risk)
 
         return cumulative_risk
 
@@ -800,11 +808,15 @@ class DecentralizedWrapper:
             ego_risk_maps.append(risk)
 
         # 4. Action selection via cost function (Eq. 5-6)
+        # risk[t] is the risk map for timestep t (1-indexed).
+        # The ego takes one action and arrives at next_pos at t=1, so we
+        # check risk at t=1 only — avoids penalizing cells that are only
+        # risky at future timesteps the ego won't reach in one step.
         final_actions = []
         for ego_idx in range(self.num_agents):
             ego_pos = positions[ego_idx]
             probs = all_probs[ego_idx]
-            risk = ego_risk_maps[ego_idx]
+            risk_t1 = ego_risk_maps[ego_idx].get(1, {})
 
             best_action = 0
             best_cost = float('inf')
@@ -814,7 +826,7 @@ class DecentralizedWrapper:
                     continue
                 next_pos = _apply_pos(ego_pos, a)
                 log_prob = -torch.log(probs[a]).item()
-                risk_at_dest = risk.get(next_pos, 0.0)
+                risk_at_dest = risk_t1.get(next_pos, 0.0)
                 cost = self.lambda_1 * log_prob + self.lambda_2 * risk_at_dest
                 if cost < best_cost:
                     best_cost = cost
