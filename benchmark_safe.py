@@ -39,6 +39,8 @@ from pogema_toolbox.registry import ToolboxRegistry
 from create_env import create_eval_env
 from gpt.inference import MAPFGPTInference, MAPFGPTInferenceConfig
 from gpt.safe_action_wrapper import (
+    CollisionCountingMAPFGPT,
+    CollisionCountingMAPFGPTConfig,
     DecentralizedWrapperAlgo,
     DecentralizedWrapperConfig,
 )
@@ -138,7 +140,62 @@ def parse_args():
             "but generate no simulation cost. None = use agents_radius (no filter)."
         ),
     )
+
+    # Quick-run filters
+    p.add_argument(
+        "--num_agents",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Restrict the num_agents grid search to these values (e.g. --num_agents 8 16).",
+    )
+    p.add_argument(
+        "--max_maps",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Use only the first N maps from each eval suite's map list.",
+    )
     return p.parse_args()
+
+
+def filter_env_grid_search(evaluation_config: dict, args) -> dict:
+    """
+    Restrict the environment grid search for quick runs.
+
+    --num_agents 8 16   keeps only those values from the num_agents grid search.
+    --max_maps N        truncates the map_name list to the first N entries.
+    """
+    if args.num_agents is None and args.max_maps is None:
+        return evaluation_config
+
+    cfg = copy.deepcopy(evaluation_config)
+    env = cfg["environment"]
+
+    if args.num_agents is not None:
+        agents_field = env.get("num_agents", {})
+        if isinstance(agents_field, dict) and "grid_search" in agents_field:
+            keep = [n for n in agents_field["grid_search"] if n in args.num_agents]
+            env["num_agents"] = {"grid_search": keep}
+
+    if args.max_maps is not None:
+        maps_field = env.get("map_name", {})
+        if isinstance(maps_field, dict) and "grid_search" in maps_field:
+            env["map_name"] = {"grid_search": maps_field["grid_search"][: args.max_maps]}
+
+    return cfg
+
+
+def build_counted_baseline_entry(baseline_entry: dict) -> dict:
+    """
+    Build a YAML-style algorithm config dict for the collision-counting baseline.
+    Copies the baseline entry verbatim but changes the name to "MAPF-GPT-Counted"
+    so the evaluator uses CollisionCountingMAPFGPT instead of bare MAPFGPTInference.
+    """
+    entry = dict(baseline_entry)
+    entry["name"] = "MAPF-GPT-Counted"
+    return entry
 
 
 def build_safe_algo_entry(baseline_entry: dict, args) -> dict:
@@ -177,7 +234,7 @@ def inject_safe_algorithms(evaluation_config: dict, args) -> dict:
 
     for algo_name, algo_cfg in original_algos.items():
         if not args.no_baseline:
-            new_algos[algo_name] = algo_cfg
+            new_algos[algo_name] = build_counted_baseline_entry(algo_cfg)
 
         # Derive a safe-variant name, e.g. "MAPF-GPT-2M" -> "Safe-2M"
         suffix = algo_name.replace("MAPF-GPT", "").strip("-") or "2M"
@@ -186,6 +243,15 @@ def inject_safe_algorithms(evaluation_config: dict, args) -> dict:
         new_algos[safe_name] = build_safe_algo_entry(algo_cfg, args)
 
     cfg["algorithms"] = new_algos
+
+    # Drop collision columns from tabular views — they're covered by
+    # print_collision_summary at the end.
+    COLLISION_KEYS = ["collision_vertex", "collision_edge", "collision_total"]
+    for view in cfg.get("results_views", {}).values():
+        if view.get("type") == "tabular":
+            existing = view.get("drop_keys", [])
+            view["drop_keys"] = existing + [k for k in COLLISION_KEYS if k not in existing]
+
     return cfg
 
 
@@ -202,6 +268,9 @@ def main():
     ToolboxRegistry.register_env(env_cfg_name, create_eval_env, Environment)
     ToolboxRegistry.register_algorithm(
         "MAPF-GPT", MAPFGPTInference, MAPFGPTInferenceConfig
+    )
+    ToolboxRegistry.register_algorithm(
+        "MAPF-GPT-Counted", CollisionCountingMAPFGPT, CollisionCountingMAPFGPTConfig
     )
     ToolboxRegistry.register_algorithm(
         "MAPF-GPT-Safe", DecentralizedWrapperAlgo, DecentralizedWrapperConfig
@@ -226,6 +295,7 @@ def main():
         with open(config_path) as f:
             evaluation_config = yaml.safe_load(f)
 
+        evaluation_config = filter_env_grid_search(evaluation_config, args)
         evaluation_config = inject_safe_algorithms(evaluation_config, args)
 
         ensure_weights(evaluation_config)

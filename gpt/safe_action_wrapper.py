@@ -25,7 +25,7 @@ from huggingface_hub import hf_hub_download
 from pathlib import Path
 
 from gpt.model import GPT, GPTConfig
-from gpt.inference import MAPFGPTInferenceConfig, strip_prefix_from_state_dict
+from gpt.inference import MAPFGPTInference, MAPFGPTInferenceConfig, strip_prefix_from_state_dict
 from tokenizer import cost2go
 from tokenizer.tokenizer import Encoder, InputParameters
 
@@ -1077,6 +1077,81 @@ class DecentralizedWrapper:
 
 from pogema_toolbox.algorithm_config import AlgoBase
 from pydantic import Extra
+
+
+class CollisionCountingMAPFGPTConfig(AlgoBase, extra=Extra.forbid):
+    """
+    Config for the collision-counting baseline wrapper.
+    Mirrors MAPFGPTInferenceConfig but registers under "MAPF-GPT-Counted"
+    so the evaluator can track vertex/edge collisions for the plain baseline.
+    """
+
+    name: Literal["MAPF-GPT-Counted"] = "MAPF-GPT-Counted"
+
+    num_agents: int = 13
+    num_previous_actions: int = 5
+    cost2go_value_limit: int = 20
+    agents_radius: int = 5
+    cost2go_radius: int = 5
+    path_to_weights: Optional[str] = "weights/model-6M.pt"
+    context_size: int = 256
+    mask_actions_history: bool = False
+    mask_goal: bool = False
+    mask_cost2go: bool = False
+    mask_greed_action: bool = False
+    repo_id: str = "aandreychuk/MAPF-GPT"
+
+
+class CollisionCountingMAPFGPT:
+    """
+    Thin adapter that runs plain MAPFGPTInference while counting vertex/edge
+    collisions each step.  Registered under "MAPF-GPT-Counted" so benchmark
+    scripts can compare baseline and safe variants on equal footing.
+
+    Call get_extra_metrics() after an episode to retrieve per-episode totals.
+    """
+
+    def __init__(self, cfg: CollisionCountingMAPFGPTConfig):
+        mapf_cfg = MAPFGPTInferenceConfig(
+            name="MAPF-GPT",
+            num_agents=cfg.num_agents,
+            num_previous_actions=cfg.num_previous_actions,
+            cost2go_value_limit=cfg.cost2go_value_limit,
+            agents_radius=cfg.agents_radius,
+            cost2go_radius=cfg.cost2go_radius,
+            path_to_weights=cfg.path_to_weights,
+            device=cfg.device,
+            context_size=cfg.context_size,
+            mask_actions_history=cfg.mask_actions_history,
+            mask_goal=cfg.mask_goal,
+            mask_cost2go=cfg.mask_cost2go,
+            mask_greed_action=cfg.mask_greed_action,
+            repo_id=cfg.repo_id,
+        )
+        self._algo = MAPFGPTInference(mapf_cfg)
+        self._collision_vertex: int = 0
+        self._collision_edge: int = 0
+
+    def act(self, observations):
+        positions = [tuple(o["global_xy"]) for o in observations]
+        actions = self._algo.act(observations)
+        stats = count_collisions(positions, actions)
+        self._collision_vertex += stats["vertex"]
+        self._collision_edge += stats["edge"]
+        return actions
+
+    def reset_states(self):
+        self._collision_vertex = 0
+        self._collision_edge = 0
+        return self._algo.reset_states()
+
+    def get_extra_metrics(self) -> dict:
+        """Return per-episode collision totals to be merged into benchmark metrics."""
+        return {
+            "collision_vertex": self._collision_vertex,
+            "collision_edge": self._collision_edge,
+            "collision_total": self._collision_vertex + self._collision_edge,
+        }
 
 
 class DecentralizedWrapperConfig(AlgoBase, extra=Extra.forbid):
